@@ -127,13 +127,11 @@ function App() {
           <div className="clip-grid">
             {clips.map((clip, index) => (
               <div key={index} className="clip">
-                <video
-                  src={clip.url}
-                  controls
-                  onLoadedMetadata={(e) => {
-                    if (clip.start) e.target.currentTime = clip.start
-                  }}
-                />
+                {clip.url?.endsWith('.mp4') ? (
+                  <video src={clip.url} controls />
+                ) : (
+                  <audio src={clip.url} controls />
+                )}
                 <div className="clip-header">
                   <h3>{clip.title || `Clip ${index + 1}`}</h3>
                   {clip.score != null && (

@@ -1,207 +1,255 @@
 from faster_whisper import WhisperModel
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 import re
 import subprocess
 import sys
 import json
 import os
 
-AUDIO_FILE = "audio.mp3"
-CLIPS_DIR = "clips"
-MODEL_SIZE = "base"
-GROUP_SIZE = 3
-TOP_N = 5
-OUTPUT_FILE = "top_chunks.txt"
-TIMESTAMPS_FILE = "clip_timestamps.txt"
-CLIPS_TO_EXPORT = 3
-CLIP_PADDING = 1.5
-MIN_CLIP_DURATION = 5
-MERGE_MAX_GAP = 3
+# ── Config ────────────────────────────────────────────────────────────────────
+AUDIO_FILE       = "audio.mp3"
+CLIPS_DIR        = "clips"
+MODEL_SIZE       = "small"   # better accuracy than "base"
+GROUP_SIZE       = 2         # smaller = more granular detection
+CLIP_PADDING     = 1.5       # seconds added before/after each clip
+MIN_CLIP_DURATION = 4        # skip clips shorter than this
+MERGE_MAX_GAP    = 2         # merge chunks within this many seconds
+MIN_SCORE        = 3         # minimum score to qualify as a highlight
+MIN_GAP_SECS     = 8         # min seconds between kept clips (dedup)
 
+analyzer = SentimentIntensityAnalyzer()
 
+# ── Transcription ─────────────────────────────────────────────────────────────
 def transcribe_segments(path: str):
     print("Loading model...")
-    model = WhisperModel(MODEL_SIZE)
-
+    model = WhisperModel(MODEL_SIZE, compute_type="int8")
     print(f"Transcribing {path}...")
-    segments, _ = model.transcribe(path)
-
+    segments, _ = model.transcribe(path, vad_filter=True)
     return list(segments)
 
 
+# ── Helpers ───────────────────────────────────────────────────────────────────
 def format_timestamp(seconds: float) -> str:
-    total_seconds = int(seconds)
-    minutes = total_seconds // 60
-    secs = total_seconds % 60
-    return f"{minutes:02d}:{secs:02d}"
+    total = int(seconds)
+    return f"{total // 60:02d}:{total % 60:02d}"
 
-
-def safe_timestamp_for_filename(seconds: float) -> str:
+def safe_ts(seconds: float) -> str:
     return format_timestamp(seconds).replace(":", "-")
-
 
 def clean_text(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def trim_to_sentence(text: str) -> str:
-    sentences = re.split(r'(?<=[.!?]) +', text)
-    return sentences[0] if sentences else text
-
-
+# ── Chunking (with overlapping window to catch boundary moments) ───────────────
 def group_segments(segments, group_size: int = GROUP_SIZE):
+    seg_list = list(segments)
+    seen = set()
     grouped = []
 
-    for i in range(0, len(segments), group_size):
-        batch = segments[i:i + group_size]
-        if not batch:
-            continue
-
-        text = " ".join(segment.text.strip() for segment in batch)
-        text = clean_text(text)
-
+    def make_chunk(batch):
+        text = clean_text(" ".join(s.text.strip() for s in batch))
         if not text:
-            continue
+            return None
+        key = (round(batch[0].start, 1), round(batch[-1].end, 1))
+        if key in seen:
+            return None
+        seen.add(key)
+        return {
+            "start":    batch[0].start,
+            "end":      batch[-1].end,
+            "text":     text,
+            "duration": batch[-1].end - batch[0].start,
+        }
 
-        grouped.append({
-            "start": batch[0].start,
-            "end": batch[-1].end,
-            "text": text
-        })
+    # Non-overlapping pass
+    for i in range(0, len(seg_list), group_size):
+        chunk = make_chunk(seg_list[i:i + group_size])
+        if chunk:
+            grouped.append(chunk)
+
+    # Overlapping pass (offset by 1) — catches moments at group boundaries
+    for i in range(1, len(seg_list) - group_size + 1, group_size):
+        chunk = make_chunk(seg_list[i:i + group_size])
+        if chunk:
+            grouped.append(chunk)
 
     return grouped
 
 
-def score_chunk(chunk_text: str):
-    chunk_lower = chunk_text.lower()
-    score = 0
+# ── Scoring ───────────────────────────────────────────────────────────────────
+HIGH_IMPACT = [
+    "crazy", "insane", "unbelievable", "incredible", "mind-blowing",
+    "jaw-dropping", "shocking", "impossible", "never seen", "first time",
+    "biggest ever", "worst ever", "greatest ever", "destroyed", "exposed",
+    "secret", "nobody knows", "hidden truth", "revealed", "disaster",
+    "crisis", "million dollars", "billion", "died", "survived", "broke",
+    "scam", "fraud", "lie", "cheat", "betray", "attack", "arrested",
+]
+
+MEDIUM_IMPACT = [
+    "amazing", "awesome", "wow", "huge", "massive", "problem", "mistake",
+    "truth", "actually", "literally", "wild", "ridiculous", "serious",
+    "important", "surprising", "unexpected", "won", "lost", "love", "hate",
+    "angry", "scared", "excited", "money", "rich", "free", "no way", "wtf",
+    "change", "different", "wrong", "right", "best", "worst", "fail",
+]
+
+HOOKS = [
+    "wait", "listen", "watch this", "look at this", "check this out",
+    "here's why", "the reason is", "what if", "turns out", "plot twist",
+    "game changer", "i can't believe", "you won't believe", "let me show",
+    "this is why", "spoiler", "breaking", "just happened", "right now",
+    "oh my", "oh no", "oh wow", "you need to", "everyone needs to",
+    "nobody talks about", "they don't want you to know",
+]
+
+STRUCTURE = [
+    "first", "second", "third", "finally", "top", "number one", "step",
+    "tip", "rule", "key point", "most important", "the real reason",
+]
+
+
+def score_chunk(text: str, duration: float):
+    lower = text.lower()
+    score = 0.0
     reasons = []
 
-    keywords = [
-        "crazy", "insane", "amazing", "unbelievable",
-        "wow", "no way", "wtf", "what", "why",
-        "huge", "massive", "problem", "mistake",
-        "secret", "truth", "actually", "literally",
-        "exciting", "interesting", "important",
-        "wild", "bro", "nah", "impossible", "ridiculous"
-    ]
+    # ── VADER sentiment (both high-positive AND high-negative are engaging) ──
+    vader = analyzer.polarity_scores(text)
+    compound = abs(vader["compound"])
 
-    hook_words = [
-        "how", "why", "what happened", "wait",
-        "listen", "look", "here's", "this is why",
-        "the reason", "what if"
-    ]
-
-    structure_words = [
-        "first", "second", "third", "top",
-        "best", "worst"
-    ]
-
-    for word in keywords:
-        if word in chunk_lower:
-            score += 2
-            reasons.append(f'keyword: "{word}"')
-
-    for hook in hook_words:
-        if hook in chunk_lower:
-            score += 2
-            reasons.append(f'hook: "{hook}"')
-
-    for word in structure_words:
-        if word in chunk_lower:
-            score += 2
-            reasons.append(f'structure: "{word}"')
-
-    exclamations = chunk_text.count("!")
-    questions = chunk_text.count("?")
-
-    if exclamations:
-        score += exclamations * 3
-        reasons.append(f"exclamation marks: {exclamations}")
-
-    if questions:
-        score += questions * 2
-        reasons.append(f"question marks: {questions}")
-
-    word_count = len(chunk_text.split())
-    if 20 <= word_count <= 80:
+    if compound >= 0.7:
+        score += 6
+        reasons.append(f"strong emotion ({compound:.2f})")
+    elif compound >= 0.5:
+        score += 4
+        reasons.append(f"clear emotion ({compound:.2f})")
+    elif compound >= 0.3:
         score += 2
-        reasons.append("good clip length")
-    elif word_count < 8:
-        score -= 2
-        reasons.append("too short")
+        reasons.append(f"mild emotion ({compound:.2f})")
 
-    if re.search(r"\b(really|very|so|extremely)\b", chunk_lower):
+    if vader["neg"] > 0.25:
+        score += 2
+        reasons.append("tension/conflict")
+    if vader["pos"] > 0.35:
+        score += 2
+        reasons.append("excitement/enthusiasm")
+
+    # ── Keywords ──────────────────────────────────────────────────────────────
+    for w in HIGH_IMPACT:
+        if w in lower:
+            score += 3
+            reasons.append(f'"{w}"')
+
+    for w in MEDIUM_IMPACT:
+        if w in lower:
+            score += 2
+            reasons.append(f'"{w}"')
+
+    for h in HOOKS:
+        if h in lower:
+            score += 3
+            reasons.append(f'hook: "{h}"')
+
+    for s in STRUCTURE:
+        if s in lower:
+            score += 1
+            reasons.append(f'structure: "{s}"')
+
+    # ── Punctuation ───────────────────────────────────────────────────────────
+    exclamations = text.count("!")
+    questions    = text.count("?")
+    if exclamations:
+        score += min(exclamations * 2, 6)
+        reasons.append(f"{exclamations} exclamation(s)")
+    if questions:
+        score += min(questions * 1.5, 4)
+        reasons.append(f"{questions} question(s)")
+
+    # ── Speaking pace (fast = energetic/excited) ──────────────────────────────
+    words = len(text.split())
+    if duration > 0:
+        pace = words / duration
+        if pace > 3.0:
+            score += 3
+            reasons.append(f"fast pace ({pace:.1f} w/s)")
+        elif pace > 2.2:
+            score += 1.5
+            reasons.append(f"active pace ({pace:.1f} w/s)")
+
+    # ── Emphasis ──────────────────────────────────────────────────────────────
+    if re.search(r"\b(really|very|so|extremely|absolutely|literally|totally|completely)\b", lower):
         score += 1
-        reasons.append("emphasis word")
+        reasons.append("emphasis")
 
-    return max(score, 0), reasons
+    caps_count = len(re.findall(r'\b[A-Z]{2,}\b', text))
+    if caps_count:
+        score += min(caps_count, 3)
+        reasons.append(f"{caps_count} caps word(s)")
+
+    # ── Penalty for very short chunks ─────────────────────────────────────────
+    if words < 8:
+        score -= 3
+
+    return max(round(score, 1), 0), reasons
 
 
 def build_scored_chunks(chunks):
-    scored_chunks = []
-
+    result = []
     for chunk in chunks:
-        score, reasons = score_chunk(chunk["text"])
-
-        if score <= 0:
-            continue
-
-        scored_chunks.append({
-            "score": score,
-            "reasons": reasons,
-            "start": chunk["start"],
-            "end": chunk["end"],
-            "text": chunk["text"]
-        })
-
-    return scored_chunks
+        score, reasons = score_chunk(chunk["text"], chunk.get("duration", 5))
+        if score >= MIN_SCORE:
+            result.append({
+                "score":   score,
+                "reasons": reasons,
+                "start":   chunk["start"],
+                "end":     chunk["end"],
+                "text":    chunk["text"],
+            })
+    return result
 
 
-def normalize_text_for_compare(text: str) -> str:
+# ── Deduplication ─────────────────────────────────────────────────────────────
+def normalize(text: str) -> str:
     return re.sub(r"[^a-z0-9\s]", "", text.lower()).strip()
 
+def remove_near_duplicates(scored_chunks):
+    # Sort by score so we always keep the highest-scored version of nearby chunks
+    by_score = sorted(scored_chunks, key=lambda x: x["score"], reverse=True)
+    kept = []
 
-def remove_near_duplicates(scored_chunks, min_gap_seconds: int = 20):
-    filtered = []
+    for chunk in by_score:
+        norm = normalize(chunk["text"])
+        discard = False
 
-    for chunk in scored_chunks:
-        keep = True
-        chunk_text_normalized = normalize_text_for_compare(chunk["text"])
+        for existing in kept:
+            too_close   = abs(chunk["start"] - existing["start"]) < MIN_GAP_SECS
+            text_overlap = norm in normalize(existing["text"]) or normalize(existing["text"]) in norm
 
-        for existing in filtered:
-            existing_text_normalized = normalize_text_for_compare(existing["text"])
-
-            starts_too_close = abs(chunk["start"] - existing["start"]) < min_gap_seconds
-            text_overlap = (
-                chunk_text_normalized in existing_text_normalized
-                or existing_text_normalized in chunk_text_normalized
-            )
-
-            if starts_too_close or text_overlap:
-                keep = False
+            if too_close or text_overlap:
+                discard = True
                 break
 
-        if keep:
-            filtered.append(chunk)
+        if not discard:
+            kept.append(chunk)
 
-    return filtered
+    return kept
 
 
-def merge_close_chunks(scored_chunks, max_gap: int = MERGE_MAX_GAP):
+# ── Merging ───────────────────────────────────────────────────────────────────
+def merge_close_chunks(scored_chunks):
     if not scored_chunks:
         return []
 
-    sorted_chunks = sorted(scored_chunks, key=lambda x: x["start"])
-    merged = [sorted_chunks[0].copy()]
+    by_time = sorted(scored_chunks, key=lambda x: x["start"])
+    merged  = [by_time[0].copy()]
 
-    for chunk in sorted_chunks[1:]:
+    for chunk in by_time[1:]:
         last = merged[-1]
-
-        if chunk["start"] - last["end"] <= max_gap:
-            last["end"] = max(last["end"], chunk["end"])
-            combined_text = clean_text(last["text"] + " " + chunk["text"])
-            last["text"] = trim_to_sentence(combined_text)
-            last["score"] += chunk["score"]
+        if chunk["start"] - last["end"] <= MERGE_MAX_GAP:
+            last["end"]     = max(last["end"], chunk["end"])
+            last["text"]    = clean_text(last["text"] + " " + chunk["text"])
+            last["score"]   = max(last["score"], chunk["score"])
             last["reasons"] = list(dict.fromkeys(last["reasons"] + chunk["reasons"]))
         else:
             merged.append(chunk.copy())
@@ -209,103 +257,83 @@ def merge_close_chunks(scored_chunks, max_gap: int = MERGE_MAX_GAP):
     return merged
 
 
-def print_and_save_top_chunks(
-    scored_chunks,
-    top_n: int = TOP_N,
-    output_file: str = OUTPUT_FILE,
-    timestamps_file: str = TIMESTAMPS_FILE
-):
-    print("\n🔥 Top interesting chunks:\n")
+# ── Clip extraction ───────────────────────────────────────────────────────────
+def is_video(path: str) -> bool:
+    return os.path.splitext(path)[1].lower() in {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
 
-    with open(output_file, "w", encoding="utf-8") as f, open(timestamps_file, "w", encoding="utf-8") as tf:
-        for i, chunk in enumerate(scored_chunks[:top_n], start=1):
-            start_label = format_timestamp(chunk["start"])
-            end_label = format_timestamp(chunk["end"])
-            reasons_text = ", ".join(chunk["reasons"]) if chunk["reasons"] else "none"
-
-            output = (
-                f"Rank: {i}\n"
-                f"Score: {chunk['score']}\n"
-                f"Timestamp: {start_label} - {end_label}\n"
-                f"Reasons: {reasons_text}\n"
-                f"{chunk['text']}\n\n"
-            )
-
-            print(output)
-            f.write(output)
-            tf.write(f"{start_label} - {end_label}\n")
-
-    print(f"Saved results to {output_file}")
-    print(f"Saved timestamps to {timestamps_file}")
-
-
-def extract_audio_clips(input_file: str, scored_chunks, top_n: int = CLIPS_TO_EXPORT):
-    print("\n🎬 Extracting audio clips...\n")
+def extract_clips(input_file: str, scored_chunks):
+    print(f"\n🎬 Extracting {len(scored_chunks)} clips...\n")
     os.makedirs(CLIPS_DIR, exist_ok=True)
+    video = is_video(input_file)
+    ext   = "mp4" if video else "mp3"
     results = []
 
-    for i, chunk in enumerate(scored_chunks[:top_n], start=1):
-        start = max(chunk["start"] - CLIP_PADDING, 0)
-        end = chunk["end"] + CLIP_PADDING
+    for i, chunk in enumerate(scored_chunks, start=1):
+        start    = max(chunk["start"] - CLIP_PADDING, 0)
+        end      = chunk["end"] + CLIP_PADDING
+        duration = end - start
 
-        if (end - start) < MIN_CLIP_DURATION:
-            print(f"Skipping clip_{i} because duration is too short.")
+        if duration < MIN_CLIP_DURATION:
+            print(f"  skip clip_{i}: too short ({duration:.1f}s)")
             continue
 
-        start_label = safe_timestamp_for_filename(start)
-        end_label = safe_timestamp_for_filename(end)
-        filename = f"clip_{i}_{start_label}-{end_label}_score_{chunk['score']}.mp3"
-        output_file = os.path.join(CLIPS_DIR, filename)
+        score_int = int(round(chunk["score"]))
+        filename  = f"clip_{i}_{safe_ts(start)}-{safe_ts(end)}_score_{score_int}.{ext}"
+        out_path  = os.path.join(CLIPS_DIR, filename)
 
-        subprocess.run(
-            [
-                "ffmpeg",
-                "-y",
-                "-i", input_file,
-                "-ss", str(start),
-                "-to", str(end),
-                "-vn",
-                "-acodec", "libmp3lame",
-                "-q:a", "2",
-                output_file
-            ],
-            check=True
-        )
+        if video:
+            cmd = [
+                "ffmpeg", "-y",
+                "-ss", str(start), "-i", input_file,
+                "-t", str(duration),
+                "-c:v", "libx264", "-preset", "ultrafast",
+                "-c:a", "aac",
+                out_path,
+            ]
+        else:
+            cmd = [
+                "ffmpeg", "-y",
+                "-ss", str(start), "-i", input_file,
+                "-t", str(duration),
+                "-vn", "-acodec", "libmp3lame", "-q:a", "2",
+                out_path,
+            ]
 
-        print(f"Created {output_file} ({format_timestamp(start)} - {format_timestamp(end)})")
+        try:
+            subprocess.run(cmd, check=True, capture_output=True)
+            print(f"  ✓ clip_{i}: {format_timestamp(start)} → {format_timestamp(end)} (score {chunk['score']})")
+        except subprocess.CalledProcessError as e:
+            print(f"  ✗ clip_{i} failed: {e.stderr.decode()[:200]}")
+            continue
 
         results.append({
             "title": f"Clip {i}",
             "start": round(chunk["start"], 2),
-            "end": round(chunk["end"], 2),
+            "end":   round(chunk["end"], 2),
             "score": chunk["score"],
-            "url": f"/clips/{filename}",
-            "text": chunk["text"],
+            "url":   f"/clips/{filename}",
+            "text":  chunk["text"],
         })
 
     return results
 
 
+# ── Main ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    audio_file = sys.argv[1] if len(sys.argv) > 1 else AUDIO_FILE
+    input_file       = sys.argv[1] if len(sys.argv) > 1 else AUDIO_FILE
     output_json_path = sys.argv[2] if len(sys.argv) > 2 else None
 
-    segments = transcribe_segments(audio_file)
-    chunks = group_segments(segments)
+    segments = transcribe_segments(input_file)
+    chunks   = group_segments(segments)
 
-    scored_chunks = build_scored_chunks(chunks)
-    scored_chunks.sort(key=lambda x: x["score"], reverse=True)
-    scored_chunks = remove_near_duplicates(scored_chunks)
-    scored_chunks = merge_close_chunks(scored_chunks)
-    scored_chunks.sort(key=lambda x: x["score"], reverse=True)
+    scored = build_scored_chunks(chunks)
+    scored = remove_near_duplicates(scored)
+    scored = merge_close_chunks(scored)
+    scored.sort(key=lambda x: x["start"])  # chronological order for output
 
-    if not scored_chunks:
-        print("No strong highlight chunks found. Try lowering the filter or changing keyword logic.")
-        clips = []
-    else:
-        print_and_save_top_chunks(scored_chunks)
-        clips = extract_audio_clips(audio_file, scored_chunks)
+    print(f"\n✅ {len(scored)} highlight clips found\n")
 
+    clips  = extract_clips(input_file, scored) if scored else []
     output = {"clips": clips}
 
     if output_json_path:
