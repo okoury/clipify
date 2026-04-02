@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+# Media files
+*.mp3
+*.mp4
+*.m4a
+*.wav
+*.zip
+audio.mp3
+input.mp4
+clips/
+
+# Pipeline output
+top_chunks.txt
+clip_timestamps.txt
+transcript.txt
+
+# Node
+clipify-frontend/node_modules/
+
+# Build
+clipify-frontend/dist/
+
+# Env
+.env
