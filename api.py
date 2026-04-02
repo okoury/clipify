@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 import shutil
 import subprocess
+import sys
 import os
 import tempfile
 import json
@@ -33,7 +34,7 @@ async def process_video(file: UploadFile = File(...)):
 
     try:
         result = subprocess.run(
-            ["python", "clipify-pipeline.py", input_path, output_path],
+            [sys.executable, "clipify-pipeline.py", input_path, output_path],
             capture_output=True,
             text=True,
         )

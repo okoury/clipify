@@ -27,3 +27,10 @@ clipify-frontend/dist/
 
 # Env
 .env
+.env.*
+
+# OS
+.DS_Store
+
+# Claude
+.claude/
