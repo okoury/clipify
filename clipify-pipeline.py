@@ -25,6 +25,9 @@ MAX_DURATION    = 90         # cap clips at this
 CLIP_PADDING    = 2.0        # seconds to extend before/after each clip zone
 MIN_ZONE_SCORE  = 5          # minimum cumulative score for a zone to qualify
 
+FAST_MODE         = True   # skip caption burn-in, use stream copy (much faster)
+MAX_SCAN_SEGMENTS = 5000   # hard cap on segments scanned to prevent O(n) blowup
+
 # ── Clip-length presets ───────────────────────────────────────────────────────
 DURATION_PRESETS = {
     #              target  min  max  cluster_gap
@@ -394,16 +397,25 @@ def score_segment(text: str, duration: float):
 
 
 # ── Cluster high-scoring segments into clip zones ─────────────────────────────
-def find_clip_zones(segments, audio_path: str = None, min_zone_score: float = None):
+def find_clip_zones(segments, audio_path: str = None, min_zone_score: float = None,
+                    max_clips: int = 0):
     """
     1. Score every segment individually (text + audio energy).
     2. Collect segments that score >= MIN_SEG_SCORE.
     3. Cluster those segments: if two are within CLUSTER_GAP seconds, same clip.
-    4. Expand each cluster toward TARGET_DURATION, cap at MAX_DURATION.
+    4. Hard-clamp each cluster to [MIN_DURATION, MAX_DURATION] (no target expansion).
     5. Discard zones below min_zone_score (defaults to MIN_ZONE_SCORE) or shorter than MIN_DURATION.
     """
     if min_zone_score is None:
         min_zone_score = MIN_ZONE_SCORE
+
+    # Cap segments to avoid O(n) blowup on very long transcripts
+    n_total = len(segments)
+    if n_total > MAX_SCAN_SEGMENTS:
+        print(f"  ⚡ Capping scan: {n_total} → {MAX_SCAN_SEGMENTS} segments", flush=True)
+        segments = segments[:MAX_SCAN_SEGMENTS]
+    n_scanned = len(segments)
+
     use_energy = (audio_path is not None
                   and audio_path.endswith(".wav")
                   and os.path.exists(audio_path))
@@ -438,13 +450,23 @@ def find_clip_zones(segments, audio_path: str = None, min_zone_score: float = No
 
     interesting.sort(key=lambda x: x["start"])
 
-    # Build clusters
-    clusters = [[interesting[0]]]
+    print(f"  📊 {n_scanned} segments scanned, {len(interesting)} high-scoring", flush=True)
+
+    # Build clusters; early-exit once we have 2× requested clips (enough to dedup down)
+    clusters    = [[interesting[0]]]
+    early_exit  = False
+    early_limit = max_clips * 2 if max_clips > 0 else 0
     for seg in interesting[1:]:
         if seg["start"] - clusters[-1][-1]["end"] <= CLUSTER_GAP:
             clusters[-1].append(seg)
         else:
             clusters.append([seg])
+        if early_limit and len(clusters) >= early_limit:
+            early_exit = True
+            break
+
+    if early_exit:
+        print(f"  ⚡ Early exit: {len(clusters)} clusters built (requested {max_clips})", flush=True)
 
     zones = []
     for cluster in clusters:
@@ -461,23 +483,22 @@ def find_clip_zones(segments, audio_path: str = None, min_zone_score: float = No
         if zone_score < min_zone_score:
             continue
 
-        # Expand symmetrically toward TARGET_DURATION
-        shortfall = max(0, TARGET_DURATION - zone_dur)
-        expand    = shortfall / 2
-        start     = max(0, zone_start - expand - CLIP_PADDING)
-        end       = zone_end + expand + CLIP_PADDING
+        # Strict hard clamp — no expansion toward TARGET_DURATION
+        start = max(0, zone_start - CLIP_PADDING)
+        end   = zone_end + CLIP_PADDING
+        dur   = end - start
 
-        # Hard-clamp to [MIN_DURATION, MAX_DURATION] — strictly enforces preset bounds
-        if end - start > MAX_DURATION:
+        if dur < MIN_DURATION:
+            end = start + MIN_DURATION
+            dur = MIN_DURATION
+
+        if dur > MAX_DURATION:
             peak  = max(cluster, key=lambda x: x["score"])
             mid   = (peak["start"] + peak["end"]) / 2
             start = max(0, mid - MAX_DURATION / 2)
             end   = start + MAX_DURATION
+            dur   = end - start
 
-        # Final safety clamp after all adjustments
-        dur = end - start
-        if dur > MAX_DURATION:
-            end = start + MAX_DURATION
         if dur < MIN_DURATION:
             continue
 
@@ -489,6 +510,31 @@ def find_clip_zones(segments, audio_path: str = None, min_zone_score: float = No
             "reasons": reasons,
         })
 
+    return zones
+
+
+# ── Fallback: evenly-spaced clips when scoring yields too few zones ───────────
+def _generate_fallback_zones(video_duration: float, n: int) -> list:
+    """
+    Space n clips evenly across the timeline.
+    Used when scoring + dedup can't fill the requested clip count.
+    """
+    clip_dur = min(MIN_DURATION, MAX_DURATION)
+    spacing  = video_duration / (n + 1)
+    zones    = []
+    for i in range(1, n + 1):
+        mid   = i * spacing
+        start = max(0.0, round(mid - clip_dur / 2, 2))
+        end   = round(min(video_duration, start + clip_dur), 2)
+        if end - start < 5:          # skip degenerate clips near end of video
+            continue
+        zones.append({
+            "start":   start,
+            "end":     end,
+            "score":   0.0,
+            "text":    "",
+            "reasons": ["fallback-evenly-spaced"],
+        })
     return zones
 
 
@@ -821,7 +867,7 @@ def _extract_one(i, zone, input_file, ext, video, annotate, segments):
         # Collect words first so we can attempt caption burn-in
         words = collect_words_for_zone(segments, start, end) if (annotate and segments) else []
 
-        if words:
+        if words and not FAST_MODE:
             ok = _burn_captions_watermark(
                 input_file, start, duration, words, out_path,
                 header_title=_thumbnail_label(title, score=zone["score"]),
@@ -873,9 +919,10 @@ def extract_clips(input_file: str, zones, annotate: bool = False, segments=None)
     os.makedirs(CLIPS_DIR, exist_ok=True)
     video   = is_video(input_file)
     ext     = "mp4" if video else "mp3"
-    workers = min(os.cpu_count() or 2, len(zones), 4)
+    workers = min(os.cpu_count() or 2, len(zones), 2)   # cap at 2 to avoid I/O thrash
 
-    print(f"\n🎬 Extracting {len(zones)} clip(s) — {workers} parallel worker(s)...\n", flush=True)
+    print(f"\n🎬 Extracting {len(zones)} clip(s) — {workers} worker(s)"
+          f" [FAST_MODE={'on' if FAST_MODE else 'off'}]...\n", flush=True)
 
     results = []
     with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -1016,23 +1063,50 @@ if __name__ == "__main__":
                     output = {"clips": []}
                 else:
                     # audio_path (WAV) stays alive here so find_clip_zones can read energy
-                    zones = find_clip_zones(segments, audio_path=transcribe_path)
+                    zones = find_clip_zones(segments, audio_path=transcribe_path,
+                                            max_clips=max_clips)
                     zones = dedup_zones(zones)
 
                     # ── Clip count logic ──────────────────────────────────────
                     if max_clips > 0:
                         if len(zones) < max_clips:
-                            # Not enough high-scoring zones — add lower-scoring ones to fill
+                            # Pass 1 failed — retry with no score floor
+                            print(f"  ⚠ Only {len(zones)}/{max_clips} zones found; "
+                                  "retrying with min_zone_score=0...", flush=True)
                             all_zones = find_clip_zones(
-                                segments, audio_path=transcribe_path, min_zone_score=0
+                                segments, audio_path=transcribe_path,
+                                min_zone_score=0, max_clips=max_clips,
                             )
                             all_zones = dedup_zones(all_zones)
-                            zones = sorted(all_zones, key=lambda z: z["score"], reverse=True)[:max_clips]
+                            zones = sorted(all_zones, key=lambda z: z["score"],
+                                           reverse=True)[:max_clips]
                         else:
-                            zones = sorted(zones, key=lambda z: z["score"], reverse=True)[:max_clips]
-                        zones = sorted(zones, key=lambda z: z["start"])
+                            zones = sorted(zones, key=lambda z: z["score"],
+                                           reverse=True)[:max_clips]
 
-                    print(f"\n✅ {len(zones)} highlight clip(s) found\n", flush=True)
+                        # Pass 2 still not enough → fill with evenly-spaced fallback clips
+                        if len(zones) < max_clips:
+                            video_dur = segments[-1].end
+                            needed    = max_clips - len(zones)
+                            fb_zones  = _generate_fallback_zones(video_dur, needed)
+                            # Exclude fallback zones that overlap existing scored zones
+                            existing_ends = {(z["start"], z["end"]) for z in zones}
+                            fb_zones = [
+                                fz for fz in fb_zones
+                                if not any(
+                                    max(fz["start"], z["start"]) < min(fz["end"], z["end"])
+                                    for z in zones
+                                )
+                            ]
+                            zones = sorted(zones + fb_zones[:needed],
+                                           key=lambda z: z["start"])
+                            print(f"  ℹ Added {len(fb_zones[:needed])} evenly-spaced "
+                                  "fallback clip(s)", flush=True)
+                        else:
+                            zones = sorted(zones, key=lambda z: z["start"])
+
+                    print(f"\n✅ {len(zones)}/{max_clips if max_clips else 'auto'} "
+                          f"clip(s) returned\n", flush=True)
                     for i, z in enumerate(zones, 1):
                         print(f"  {i}. [{fmt_ts(z['start'])}-{fmt_ts(z['end'])}] "
                               f"{z['end']-z['start']:.0f}s | score {z['score']}", flush=True)
