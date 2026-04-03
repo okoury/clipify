@@ -129,7 +129,15 @@ def transcribe(path: str, word_timestamps: bool = False):
 
 # ── Hook generation ───────────────────────────────────────────────────────────
 def _extract_subject(text: str) -> str:
-    """Detect a short subject phrase from transcript text for hook templates."""
+    """Detect subject: capitalized proper name first, then pronouns, then fallback."""
+    # Multi-word proper names (e.g. "John Smith", "Dr. Davis")
+    names = re.findall(r'\b([A-Z][a-z]{1,}(?:\s+[A-Z][a-z]{1,})+)\b', text)
+    if names:
+        return names[0].upper()
+    # Single capitalized word mid-sentence (not at very start of text)
+    single = re.findall(r'(?<=[a-z] )([A-Z][a-z]{2,})\b', text)
+    if single:
+        return single[0].upper()
     lower = " " + text.lower() + " "
     for phrase in ("this guy", "this dude", "this man", "this woman", "this person"):
         if phrase in lower:
@@ -140,36 +148,39 @@ def _extract_subject(text: str) -> str:
     return "THIS GUY"
 
 
-def generate_clip_title(text: str, score: float = 0.0) -> str:
+def generate_clip_title(text: str, score: float = 0.0, custom_hook: str = "") -> str:
     """Return a punchy, curiosity-driven uppercase hook title (5–10 words)."""
-    lower = text.lower()
+    if custom_hook:
+        return custom_hook.upper()
+
+    lower   = text.lower()
     subject = _extract_subject(text)
     sentiment = analyzer.polarity_scores(text)["compound"]
 
     # Keyword-driven template selection (deterministic, ordered by specificity)
     if any(p in lower for p in ("can't believe", "cannot believe", "i never")):
-        title = f"I CAN'T BELIEVE {subject} DID THIS"
+        title = f"I CAN'T BELIEVE {subject} DID THIS 😳"
     elif any(w in lower for w in ("crazy", "insane", "unbelievable", "mind-blowing")):
-        title = f"{subject} SAID THE CRAZIEST THING"
+        title = f"{subject} SAID THE CRAZIEST THING 🤯"
     elif any(w in lower for w in ("mistake", "disaster", "ruined", "backfired")):
-        title = "THIS WAS A HUGE MISTAKE"
+        title = f"{subject} JUST MADE A HUGE MISTAKE 😬"
     elif any(w in lower for w in ("secret", "exposed", "nobody knows", "they don't want")):
-        title = "NOBODY TALKS ABOUT THIS"
+        title = f"{subject} EXPOSED THIS SECRET 😱"
     elif any(w in lower for w in ("changed", "transformation", "changed my life", "game changer")):
-        title = "THIS CHANGED EVERYTHING"
+        title = f"THIS CHANGED {subject}'S LIFE FOREVER 🔥"
     elif any(h in lower for h in ("no way", "you won't believe", "wait until")):
-        title = f"NO WAY {subject} JUST DID THIS"
+        title = f"NO WAY {subject} JUST DID THIS 😳"
     elif any(w in lower for w in ("shocking", "jaw-dropping", "impossible", "never seen")):
-        title = f"WAIT UNTIL YOU SEE WHAT {subject} DID"
+        title = f"{subject} SAID THIS IN PUBLIC?? 😱"
     elif sentiment < -0.35 or any(w in lower for w in ("arrested", "betrayed", "fraud", "scam")):
-        title = "THE TRUTH FINALLY CAME OUT"
+        title = f"THE TRUTH ABOUT {subject} FINALLY CAME OUT"
     elif score > 12 or any(w in lower for w in ("million", "billion", "greatest ever", "biggest")):
-        title = "YOU WON'T BELIEVE THIS"
+        title = f"{subject} JUST DID THE UNTHINKABLE 🔥"
     else:
         # Fallback: pick punchiest sentence, trim to 7 words
         sentences = [s.strip() for s in re.split(r'[.!?]+', text) if len(s.split()) >= 3]
         if not sentences:
-            return "THIS IS ABSOLUTELY INSANE"
+            return f"{subject} JUST DID THIS 😳"
         best = max(sentences, key=lambda s: (
             sum(3 for w in HIGH_IMPACT   if w in s.lower()) +
             sum(2 for w in MEDIUM_IMPACT if w in s.lower())
@@ -196,28 +207,48 @@ def _thumbnail_label(title: str, score: float = 0.0) -> str:
 
 
 def generate_clip_summary(text: str, score: float = 0.0) -> str:
-    """Return a punchy one-liner hook — not an extractive transcript summary."""
-    lower = text.lower()
-    sentiment = analyzer.polarity_scores(text)["compound"]
+    """
+    Extract the most informative sentence from the transcript as a short summary.
+    Falls back to keyword-driven one-liners if no strong sentence is found.
+    """
+    sentences = [s.strip() for s in re.split(r'[.!?]+', text) if 4 <= len(s.split()) <= 30]
+    if sentences:
+        def _sent_score(s):
+            lo = s.lower()
+            return (
+                sum(3 for w in HIGH_IMPACT   if w in lo) +
+                sum(2 for w in MEDIUM_IMPACT if w in lo) +
+                sum(2 for h in HOOKS         if h in lo) +
+                abs(analyzer.polarity_scores(s)["compound"]) * 5
+            )
+        best = max(sentences, key=_sent_score)
+        if _sent_score(best) > 2:               # only use if meaningfully scored
+            words   = best.split()[:18]          # cap at ~18 words
+            excerpt = censor(clean(" ".join(words)))
+            if excerpt:
+                tail = excerpt[-1]
+                return excerpt.capitalize() + ("" if tail in ".!?" else ".")
 
-    if any(p in lower for p in ("can't believe", "unbelievable", "i never")):
-        return "The moment that left everyone speechless."
+    # Keyword fallback (for near-silent or low-information clips)
+    lower     = text.lower()
+    sentiment = analyzer.polarity_scores(text)["compound"]
+    subject   = _extract_subject(text)
+    if any(p in lower for p in ("can't believe", "unbelievable")):
+        return f"{subject} couldn't believe what just happened."
     elif any(w in lower for w in ("crazy", "insane", "mind-blowing")):
-        return "Things got crazy fast — you have to see this."
+        return f"{subject} reacted to something completely unexpected."
     elif any(w in lower for w in ("secret", "exposed", "nobody knows")):
-        return "The secret they never wanted you to find out."
+        return f"{subject} revealed something nobody was supposed to know."
     elif any(w in lower for w in ("mistake", "disaster", "backfired")):
-        return "A mistake that changed everything."
-    elif any(w in lower for w in ("changed", "transformation", "game changer")):
-        return "The moment everything changed."
+        return f"{subject} made a mistake that changed everything."
     elif sentiment > 0.4:
-        return "This had everyone talking."
+        return f"{subject} had an incredible reaction to this."
     elif sentiment < -0.35:
-        return "Nobody saw this coming."
+        return f"{subject} said something that shocked everyone."
     elif score > 10:
-        return "The wildest moment of the entire video."
+        return f"One of the wildest moments in the entire video."
     else:
-        return "One of the most talked-about moments in the clip."
+        return f"{subject} said something worth clipping."
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -852,13 +883,13 @@ def _burn_captions_watermark(input_file: str, start: float, duration: float,
             pass
 
 
-def _extract_one(i, zone, input_file, ext, video, annotate, segments):
+def _extract_one(i, zone, input_file, ext, video, annotate, segments, custom_hook=""):
     """Extract a single clip and its thumbnail. Designed to run in a thread pool."""
     start    = zone["start"]
     end      = zone["end"]
     duration = end - start
     score_i  = int(round(zone["score"]))
-    title    = generate_clip_title(zone["text"], score=zone["score"])
+    title    = generate_clip_title(zone["text"], score=zone["score"], custom_hook=custom_hook)
     filename = f"clip_{i}_{safe_ts(start)}-{safe_ts(end)}_score_{score_i}.{ext}"
     out_path = os.path.join(CLIPS_DIR, filename)
 
@@ -915,7 +946,8 @@ def _extract_one(i, zone, input_file, ext, video, annotate, segments):
     return clip
 
 
-def extract_clips(input_file: str, zones, annotate: bool = False, segments=None):
+def extract_clips(input_file: str, zones, annotate: bool = False, segments=None,
+                  custom_hook: str = ""):
     os.makedirs(CLIPS_DIR, exist_ok=True)
     video   = is_video(input_file)
     ext     = "mp4" if video else "mp3"
@@ -927,7 +959,8 @@ def extract_clips(input_file: str, zones, annotate: bool = False, segments=None)
     results = []
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futs = {
-            pool.submit(_extract_one, i, zone, input_file, ext, video, annotate, segments): i
+            pool.submit(_extract_one, i, zone, input_file, ext, video, annotate, segments,
+                        custom_hook): i
             for i, zone in enumerate(zones, 1)
         }
         for fut in as_completed(futs):
@@ -940,7 +973,7 @@ def extract_clips(input_file: str, zones, annotate: bool = False, segments=None)
 
 
 # ── Annotate-only mode ────────────────────────────────────────────────────────
-def process_annotate_only(input_file: str) -> dict:
+def process_annotate_only(input_file: str, custom_hook: str = "") -> dict:
     """
     Transcribe the entire video with word timestamps and return it as a single
     annotated clip (no highlight detection, no cutting).
@@ -980,14 +1013,14 @@ def process_annotate_only(input_file: str) -> dict:
                 })
 
         full_text = censor(clean(" ".join(seg.text for seg in segments)))
-        title     = generate_clip_title(full_text)
+        title     = generate_clip_title(full_text, custom_hook=custom_hook)
 
         # Attempt caption burn-in + watermark; fall back to plain copy
         burned = False
         if all_words and is_video(input_file):
             burned = _burn_captions_watermark(
                 input_file, 0, duration, all_words, out_path,
-                header_title=_thumbnail_label(title),
+                header_title=_thumbnail_label(title) if HEADER_ENABLED else "",
             )
             if burned:
                 print(f"  ✓ captions burned into clips/{filename}", flush=True)
@@ -1026,6 +1059,8 @@ if __name__ == "__main__":
         mode_arg         = sys.argv[3] if len(sys.argv) > 3 else ""
         clip_length      = sys.argv[4] if len(sys.argv) > 4 else "medium"
         max_clips        = int(sys.argv[5]) if len(sys.argv) > 5 else 0
+        HEADER_ENABLED   = sys.argv[6] != "0" if len(sys.argv) > 6 else True
+        custom_hook      = sys.argv[7] if len(sys.argv) > 7 else ""
         annotate_only    = mode_arg == "annotate_only"
         annotate         = mode_arg == "annotate"
 
@@ -1043,7 +1078,7 @@ if __name__ == "__main__":
             sys.exit(1)
 
         if annotate_only:
-            output = process_annotate_only(input_file)
+            output = process_annotate_only(input_file, custom_hook=custom_hook)
         else:
             # Extract 16 kHz mono WAV — Whisper's native format AND source for RMS energy scoring
             audio_path      = None
@@ -1113,7 +1148,8 @@ if __name__ == "__main__":
 
                     # Always pass segments so every clip gets word timestamps
                     clips  = extract_clips(input_file, zones, annotate=True,
-                                           segments=segments) if zones else []
+                                           segments=segments,
+                                           custom_hook=custom_hook) if zones else []
                     output = {"clips": clips}
 
             finally:

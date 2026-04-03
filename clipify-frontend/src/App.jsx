@@ -893,6 +893,8 @@ export default function App() {
   const [annotate,        setAnnotate]        = useState(false)
   const [highlight,       setHighlight]       = useState(true)
   const [emojis,          setEmojis]          = useState(false)
+  const [punchyHeader,    setPunchyHeader]    = useState(true)
+  const [customHook,      setCustomHook]      = useState('')
   const [clips,     setClips]     = useState([])
   const [dragOver,  setDragOver]  = useState(false)
   const fileRef   = useRef(null)
@@ -932,6 +934,8 @@ export default function App() {
         fd.append('clip_length', clipLength)
         fd.append('max_clips', maxClips)
       }
+      fd.append('header_enabled', punchyHeader)
+      if (customHook.trim()) fd.append('custom_hook', customHook.trim())
       const headers = {}; if (token) headers['Authorization'] = `Bearer ${token}`
       const res = await fetch('/api/process', { method:'POST', body:fd, signal:ctrl.signal, headers })
       if (!res.ok) { const e=await res.json().catch(()=>({})); throw new Error(e.detail||`Server error ${res.status}`) }
@@ -1061,6 +1065,28 @@ export default function App() {
                   {showMoreOptions && (
                     <div className="more-options-panel">
                       <FontPicker value={captionFont} onChange={setCaptionFont} />
+                      <label className="more-option-row">
+                        <input type="checkbox" checked={punchyHeader} onChange={e => setPunchyHeader(e.target.checked)} />
+                        <span className="more-option-label">
+                          Add Punchy Header
+                          <span className="more-option-hint">burn hook title at clip start</span>
+                        </span>
+                      </label>
+                      <div className="more-option-input-wrap">
+                        <label className="more-option-label" htmlFor="custom-hook-input">
+                          Custom Hook
+                          <span className="more-option-hint">override the generated title</span>
+                        </label>
+                        <input
+                          id="custom-hook-input"
+                          className="custom-hook-input"
+                          type="text"
+                          placeholder="e.g. HE REALLY SAID THIS 😳"
+                          maxLength={120}
+                          value={customHook}
+                          onChange={e => setCustomHook(e.target.value)}
+                        />
+                      </div>
                     </div>
                   )}
                 </div>

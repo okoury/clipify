@@ -27,7 +27,7 @@ def _load_pipeline():
     vader_stub = types.ModuleType("vaderSentiment")
     vader_sa   = types.ModuleType("vaderSentiment.vaderSentiment")
     vader_sa.SentimentIntensityAnalyzer = MagicMock(return_value=MagicMock(
-        polarity_scores=MagicMock(return_value={"compound": 0.0})
+        polarity_scores=MagicMock(return_value={"compound": 0.0, "neg": 0.0, "pos": 0.0, "neu": 1.0})
     ))
     sys.modules.setdefault("vaderSentiment", vader_stub)
     sys.modules.setdefault("vaderSentiment.vaderSentiment", vader_sa)

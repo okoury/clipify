@@ -516,6 +516,46 @@
   gap: 14px;
 }
 
+.more-option-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  cursor: pointer;
+}
+.more-option-row input[type="checkbox"] { margin-top: 3px; cursor: pointer; }
+.more-option-label {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 13px;
+  color: var(--text-3);
+  font-weight: 500;
+}
+.more-option-hint {
+  font-size: 11px;
+  color: var(--text-6);
+  font-weight: 400;
+}
+.more-option-input-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.custom-hook-input {
+  width: 100%;
+  background: rgba(255,255,255,0.05);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 12px;
+  color: var(--text-1);
+  font-size: 13px;
+  outline: none;
+  transition: border-color var(--t);
+  box-sizing: border-box;
+}
+.custom-hook-input::placeholder { color: var(--text-6); }
+.custom-hook-input:focus { border-color: var(--accent); }
+
 
 /* ════════════════════════════════════════════════════════
    CLIP COUNT PICKER

@@ -216,6 +216,8 @@ async def process_video(
     annotate_only: bool = Form(False),
     clip_length: str = Form("medium"),
     max_clips: int = Form(0),
+    header_enabled: bool = Form(True),
+    custom_hook: str = Form(""),
     user_id: Optional[int] = Depends(auth.get_optional_user_id),
 ):
     suffix = os.path.splitext(file.filename or "")[1] or ".mp4"
@@ -229,9 +231,10 @@ async def process_video(
     os.close(output_fd)
 
     try:
-        clip_length = clip_length if clip_length in ("short", "medium", "long") else "medium"
-        max_clips   = max(0, min(int(max_clips), 20))
-        cache_mode  = "annotate_only" if annotate_only else ("annotate" if annotate else "clips")
+        clip_length  = clip_length if clip_length in ("short", "medium", "long") else "medium"
+        max_clips    = max(0, min(int(max_clips), 20))
+        custom_hook  = (custom_hook or "").strip()[:120]   # cap length, strip whitespace
+        cache_mode   = "annotate_only" if annotate_only else ("annotate" if annotate else "clips")
 
         # ── Cache lookup ──────────────────────────────────────────────────────
         hasher = hashlib.sha256()
@@ -240,7 +243,8 @@ async def process_video(
                 hasher.update(chunk)
         file_hash = hasher.hexdigest()
 
-        cached = db.get_cache(file_hash, cache_mode, clip_length, max_clips)
+        # Skip cache when custom_hook is set (title/summary would differ)
+        cached = db.get_cache(file_hash, cache_mode, clip_length, max_clips) if not custom_hook else None
         if cached is not None:
             if user_id:
                 clips = cached.get("clips", [])
@@ -255,12 +259,10 @@ async def process_video(
 
         # ── Run pipeline (max 2 concurrent) ──────────────────────────────────
         cmd = [sys.executable, PIPELINE, input_path, output_path]
-        if annotate_only:
-            cmd.extend(["annotate_only", clip_length, str(max_clips)])
-        elif annotate:
-            cmd.extend(["annotate", clip_length, str(max_clips)])
-        else:
-            cmd.extend(["", clip_length, str(max_clips)])
+        mode_str = "annotate_only" if annotate_only else ("annotate" if annotate else "")
+        cmd.extend([mode_str, clip_length, str(max_clips),
+                    "1" if header_enabled else "0",
+                    custom_hook])
 
         async with _PIPELINE_SEM:
             try:
