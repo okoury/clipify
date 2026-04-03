@@ -1,21 +1,32 @@
-*, *::before, *::after {
-  box-sizing: border-box;
-}
+/* ── RESET ───────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box }
+* { margin: 0; padding: 0 }
+img, video, audio { max-width: 100%; display: block }
+button { cursor: pointer; font-family: inherit }
+a { text-decoration: none; color: inherit }
 
-* {
-  margin: 0;
-  padding: 0;
-}
-
+/* ── BASE ────────────────────────────────────────────── */
 body {
-  background: #08090d;
-  color: #e2e8f0;
-  font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   min-height: 100vh;
+  line-height: 1.5;
 }
 
-#root {
-  min-height: 100vh;
+#root { min-height: 100vh }
+
+/* ── SCROLLBAR ───────────────────────────────────────── */
+::-webkit-scrollbar { width: 6px; height: 6px }
+::-webkit-scrollbar-track { background: transparent }
+::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 99px }
+::-webkit-scrollbar-thumb:hover { background: var(--text-4) }
+
+/* ── FOCUS ───────────────────────────────────────────── */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+  border-radius: var(--r-sm);
 }
