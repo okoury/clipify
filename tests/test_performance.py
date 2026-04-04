@@ -163,22 +163,22 @@ class TestFallbackGeneration(unittest.TestCase):
 
 # ══════════════════════════════════════════════════════════════════════════════
 class TestFastMode(unittest.TestCase):
-    """D) FAST_MODE=True skips _burn_captions_watermark."""
+    """D) _burn_captions_watermark is always called for video clips."""
 
-    def test_fast_mode_skips_burn(self):
+    def test_burn_always_called(self):
+        """Captions are always burned — FAST_MODE no longer skips burn."""
         pipeline.FAST_MODE = True
         zone = {"start": 0.0, "end": 20.0, "score": 5.0, "text": "test",
                 "reasons": [], "words": []}
 
-        with patch.object(pipeline, "_burn_captions_watermark") as mock_burn, \
-             patch.object(pipeline, "_stream_copy_clip", return_value=True), \
+        with patch.object(pipeline, "_burn_captions_watermark", return_value=True) as mock_burn, \
              patch.object(pipeline, "generate_thumbnail", return_value=None), \
              patch.object(pipeline, "collect_words_for_zone", return_value=[
                  {"word": "hi", "start": 0.0, "end": 0.5}
              ]):
-            pipeline._extract_one(1, zone, "fake.mp4", "mp4", True, True, [])
+            pipeline._extract_one(1, zone, "fake.mp4", "mp4", True, True, [MagicMock()])
 
-        mock_burn.assert_not_called()
+        mock_burn.assert_called_once()
 
     def test_slow_mode_uses_burn(self):
         pipeline.FAST_MODE = False

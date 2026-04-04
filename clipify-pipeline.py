@@ -572,54 +572,38 @@ def _generate_fallback_zones(video_duration: float, n: int) -> list:
 
 
 # ── Manual mode: deterministic, guaranteed clip count ─────────────────────────
-def find_manual_clip_zones(segments, n: int) -> list:
+def find_manual_clip_zones(video_duration: float, n: int) -> list:
     """
-    Divide the timeline into n equal windows; use the window midpoint as the
-    clip centre (no scoring used for placement — fully deterministic).
-    Hard-clamps to [MIN_DURATION, MAX_DURATION], never skips a window.
+    Purely deterministic: divide timeline into n equal windows, take clip_dur
+    centred in each window. NO scoring, NO transcript dependency.
+    Always returns exactly n zones.
     """
-    if not segments or n <= 0:
+    if n <= 0 or video_duration <= 0:
         return []
 
-    video_duration = segments[-1].end
-    # Reduce n only if there is literally not enough video for n clips
-    if video_duration < MIN_DURATION * n:
-        n = max(1, int(video_duration // MIN_DURATION))
-
-    window   = video_duration / n
     clip_dur = min(max(MIN_DURATION, TARGET_DURATION), MAX_DURATION)
+    window   = video_duration / n
     zones    = []
 
     for i in range(n):
-        win_start = i * window
-        win_end   = (i + 1) * window
-        mid       = (win_start + win_end) / 2   # purely positional — no scoring
-
+        mid   = (i + 0.5) * window          # centre of window — purely positional
         start = max(0.0, round(mid - clip_dur / 2, 2))
         end   = round(min(video_duration, start + clip_dur), 2)
 
-        # Push forward to avoid overlap with the previous zone
+        # Push forward to clear previous zone (never skip)
         if zones and start < zones[-1]["end"] + 0.5:
             start = round(zones[-1]["end"] + 0.5, 2)
             end   = round(min(video_duration, start + clip_dur), 2)
 
-        # Hard clamp — never skip (guarantees count)
-        if end - start > MAX_DURATION:
-            end = round(start + MAX_DURATION, 2)
-        # Accept whatever remains (even if slightly < MIN_DURATION near end of file)
-
-        # Gather text for this zone (display only — not used for placement)
-        zone_segs = [s for s in segments if s.start < end and s.end > start]
-        text      = censor(clean(" ".join(s.text for s in zone_segs)))
-
         zones.append({
-            "start":   round(start, 2),
-            "end":     round(end, 2),
-            "score":   0.0,       # manual zones have no scoring
-            "text":    text,
+            "start":   start,
+            "end":     end,
+            "score":   0.0,
+            "text":    "",        # filled after transcription
             "reasons": [],
         })
 
+    assert len(zones) == n, f"Manual mode: expected {n} zones, got {len(zones)}"
     return zones
 
 
@@ -652,22 +636,35 @@ def is_video(path: str) -> bool:
 def collect_words_for_zone(segments, zone_start: float, zone_end: float):
     """Return word timestamps adjusted to be relative to the clip start."""
     words = []
+    duration = zone_end - zone_start
     for seg in segments:
-        if not seg.words:
+        # Segment entirely outside zone — skip
+        if seg.end < zone_start or seg.start > zone_end:
             continue
-        for w in seg.words:
-            # Strictly exclude words entirely outside the zone
-            if w.end <= zone_start or w.start >= zone_end:
-                continue
-            rel_start = max(0.0, round(w.start - zone_start, 3))
-            rel_end   = round(min(w.end, zone_end) - zone_start, 3)
-            if rel_start >= rel_end:
-                continue
-            words.append({
-                "word":  censor(w.word.strip()),
-                "start": rel_start,
-                "end":   rel_end,
-            })
+        if seg.words:
+            for w in seg.words:
+                # Inclusive boundary: include words that touch the zone edge
+                if w.end < zone_start or w.start > zone_end:
+                    continue
+                rel_start = max(0.0, round(w.start - zone_start, 3))
+                rel_end   = round(min(w.end, zone_end) - zone_start, 3)
+                if rel_start >= rel_end:
+                    continue
+                words.append({
+                    "word":  censor(w.word.strip()),
+                    "start": rel_start,
+                    "end":   rel_end,
+                })
+        else:
+            # Fallback: no word-level timestamps — use segment boundaries
+            rel_start = max(0.0, round(seg.start - zone_start, 3))
+            rel_end   = round(min(seg.end, zone_end) - zone_start, 3)
+            if rel_start < rel_end:
+                words.append({
+                    "word":  censor(seg.text.strip()),
+                    "start": rel_start,
+                    "end":   rel_end,
+                })
     return words
 
 
@@ -803,6 +800,16 @@ def _run_ffmpeg(cmd, timeout=300):
         sys.exit(1)
 
 
+def get_video_duration(video_path: str) -> float:
+    """Use ffprobe to return video duration in seconds (no transcription needed)."""
+    r = subprocess.run(
+        ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", video_path],
+        capture_output=True, text=True,
+    )
+    data = json.loads(r.stdout)
+    return float(data["format"]["duration"])
+
+
 def _ts_ass(seconds: float) -> str:
     """Format seconds as h:mm:ss.cc (ASS subtitle timestamp)."""
     total_cs = round(max(0.0, seconds) * 100)
@@ -903,7 +910,7 @@ def _burn_captions_watermark(input_file: str, start: float, duration: float,
         safe_ass = ass_path.replace("\\", "\\\\").replace(":", "\\:")
 
         vf_parts = [
-            f"ass='{safe_ass}'",
+            f"subtitles='{safe_ass}'",
             # Faint watermark — bottom-right corner
             "drawtext=text='Snipflow':fontcolor=white@0.22:fontsize=28:"
             "x=w-tw-20:y=h-th-20:shadowcolor=black@0.15:shadowx=1:shadowy=1",
@@ -920,10 +927,15 @@ def _burn_captions_watermark(input_file: str, start: float, duration: float,
                 f"enable='lt(t\\,{HEADER_DURATION})'"
             )
 
+        # Two-pass seek: fast keyframe seek then 2s accurate fine-seek.
+        # Avoids decoding entire video from start — critical for performance.
+        pre_seek  = max(0.0, start - 2.0)
+        fine_seek = round(start - pre_seek, 3)
         return _run_ffmpeg([
             "ffmpeg", "-y",
+            "-ss", str(pre_seek),
             "-i", input_file,
-            "-ss", str(start),
+            "-ss", str(fine_seek),
             "-t", str(duration),
             "-vf", ",".join(vf_parts),
             "-c:v", "libx264", "-preset", "fast", "-crf", "23",
@@ -954,10 +966,13 @@ def _burn_watermark_only(input_file: str, start: float, duration: float,
             f"shadowcolor=black@0.65:shadowx=3:shadowy=3:"
             f"enable='lt(t\\,{HEADER_DURATION})'"
         )
+    pre_seek  = max(0.0, start - 2.0)
+    fine_seek = round(start - pre_seek, 3)
     return _run_ffmpeg([
         "ffmpeg", "-y",
+        "-ss", str(pre_seek),
         "-i", input_file,
-        "-ss", str(start),
+        "-ss", str(fine_seek),
         "-t", str(duration),
         "-vf", ",".join(vf_parts),
         "-c:v", "libx264", "-preset", "fast", "-crf", "23",
@@ -979,28 +994,26 @@ def _extract_one(i, zone, input_file, ext, video, annotate, segments, custom_hoo
 
     ok = False
     if video:
-        # Collect words first so we can attempt caption burn-in
+        # Collect words; always ensure non-empty so captions always burn
         words = collect_words_for_zone(segments, start, end) if (annotate and segments) else []
+        if not words:
+            words = [{"word": zone["text"] or " ", "start": 0.0, "end": duration}]
 
-        if words:
-            # Always burn captions when we have them — FAST_MODE does NOT disable this
-            ok = _burn_captions_watermark(
-                input_file, start, duration, words, out_path,
-                header_title=_thumbnail_label(title, score=zone["score"]),
-            )
-            if not ok:
-                print(f"  clip_{i} caption burn failed, falling back...", flush=True)
+        print(f"[DEBUG] clip_{i} words count: {len(words)}, duration: {duration:.1f}s", flush=True)
 
-        if not ok and BURN_VISUALS:
-            # No captions but BURN_VISUALS: add watermark + optional header
+        # Always burn captions + watermark — no fallback to stream copy for video
+        ok = _burn_captions_watermark(
+            input_file, start, duration, words, out_path,
+            header_title=_thumbnail_label(title, score=zone["score"]),
+        )
+        if not ok:
+            print(f"  clip_{i} caption burn failed, trying watermark-only...", flush=True)
             ok = _burn_watermark_only(
                 input_file, start, duration, out_path,
                 header_title=_thumbnail_label(title, score=zone["score"]),
             )
-            if not ok:
-                print(f"  clip_{i} watermark burn failed, falling back to stream copy...", flush=True)
-
         if not ok:
+            print(f"  clip_{i} watermark burn failed, falling back to stream copy...", flush=True)
             ok = _stream_copy_clip(input_file, start, duration, out_path)
     else:
         words = collect_words_for_zone(segments, start, end) if (annotate and segments) else []
@@ -1061,8 +1074,9 @@ def extract_clips(input_file: str, zones, annotate: bool = False, segments=None,
         }
         for fut in as_completed(futs):
             clip = fut.result()
-            if clip:
-                results.append(clip)
+            if not clip:
+                raise RuntimeError(f"Clip {futs[fut]} failed to export — check FFmpeg output above")
+            results.append(clip)
 
     # Restore chronological order (futures complete in arbitrary order)
     return sorted(results, key=lambda c: c["start"])
@@ -1175,8 +1189,49 @@ if __name__ == "__main__":
 
         if annotate_only:
             output = process_annotate_only(input_file, custom_hook=custom_hook)
+
+        elif max_clips > 0:
+            # ── MANUAL MODE: fully deterministic, no AI influence ─────────────
+            print(f"📌 Manual mode: {max_clips} clip(s) requested", flush=True)
+
+            # Step 1: get duration via ffprobe (instant, no transcription)
+            video_duration = get_video_duration(input_file)
+            print(f"  Video duration: {video_duration:.1f}s", flush=True)
+
+            # Step 2: generate zones deterministically
+            zones = find_manual_clip_zones(video_duration, max_clips)
+            print(f"\n✅ {len(zones)} zone(s) generated\n", flush=True)
+            for i, z in enumerate(zones, 1):
+                print(f"  {i}. [{fmt_ts(z['start'])}-{fmt_ts(z['end'])}] "
+                      f"{z['end']-z['start']:.0f}s", flush=True)
+
+            # Step 3: transcribe for captions (word timestamps)
+            audio_path      = None
+            transcribe_path = input_file
+            if is_video(input_file):
+                print("\nExtracting audio for captions...", flush=True)
+                audio_path      = extract_audio_for_transcription(input_file)
+                transcribe_path = audio_path
+
+            try:
+                segments = transcribe(transcribe_path, word_timestamps=True)
+                print(f"  {len(segments)} segments transcribed", flush=True)
+
+                # Fill zone text from transcript (display only)
+                for zone in zones:
+                    zone_segs = [s for s in segments
+                                 if s.start < zone["end"] and s.end > zone["start"]]
+                    zone["text"] = censor(clean(" ".join(s.text for s in zone_segs)))
+
+                clips  = extract_clips(input_file, zones, annotate=True,
+                                       segments=segments, custom_hook=custom_hook)
+                output = {"clips": clips}
+            finally:
+                if audio_path and audio_path != input_file and os.path.exists(audio_path):
+                    os.unlink(audio_path)
+
         else:
-            # Extract 16 kHz mono WAV — Whisper's native format AND source for RMS energy scoring
+            # ── AUTO MODE: score-based, AI-driven ────────────────────────────
             audio_path      = None
             transcribe_path = input_file
             if is_video(input_file):
@@ -1185,7 +1240,6 @@ if __name__ == "__main__":
                 transcribe_path = audio_path
 
             try:
-                # Always use word_timestamps=True so every clip includes captions
                 segments = transcribe(transcribe_path, word_timestamps=True)
                 print(f"  {len(segments)} segments transcribed", flush=True)
 
@@ -1193,22 +1247,14 @@ if __name__ == "__main__":
                     print("WARNING: no speech detected in video", file=sys.stderr)
                     output = {"clips": []}
                 else:
-                    if max_clips > 0:
-                        # ── Manual mode: deterministic, guaranteed count ───────
-                        print(f"  📌 Manual mode: {max_clips} clip(s) requested", flush=True)
-                        zones = find_manual_clip_zones(segments, max_clips)
-                    else:
-                        # ── Auto mode: score-based ────────────────────────────
-                        zones = find_clip_zones(segments, audio_path=transcribe_path)
-                        zones = dedup_zones(zones)
+                    zones = find_clip_zones(segments, audio_path=transcribe_path)
+                    zones = dedup_zones(zones)
 
-                    print(f"\n✅ {len(zones)} clip(s) "
-                          f"({'manual' if max_clips else 'auto'} mode)\n", flush=True)
+                    print(f"\n✅ {len(zones)} clip(s) (auto mode)\n", flush=True)
                     for i, z in enumerate(zones, 1):
                         print(f"  {i}. [{fmt_ts(z['start'])}-{fmt_ts(z['end'])}] "
                               f"{z['end']-z['start']:.0f}s | score {z['score']}", flush=True)
 
-                    # Always pass segments so every clip gets word timestamps
                     clips  = extract_clips(input_file, zones, annotate=True,
                                            segments=segments,
                                            custom_hook=custom_hook) if zones else []

@@ -58,27 +58,23 @@ class TestManualMode(unittest.TestCase):
         pipeline.TARGET_DURATION = 25
 
     def test_returns_exact_count(self):
-        segs  = _segs(30, 300.0)
-        zones = pipeline.find_manual_clip_zones(segs, 5)
+        zones = pipeline.find_manual_clip_zones(300.0, 5)
         self.assertEqual(len(zones), 5)
 
     def test_returns_exact_count_varied(self):
         for n in (1, 3, 7, 10):
-            segs  = _segs(40, float(n * 60))
-            zones = pipeline.find_manual_clip_zones(segs, n)
+            zones = pipeline.find_manual_clip_zones(float(n * 60), n)
             self.assertEqual(len(zones), n, f"Expected {n}, got {len(zones)}")
 
     def test_duration_within_bounds(self):
-        segs  = _segs(30, 300.0)
-        zones = pipeline.find_manual_clip_zones(segs, 5)
+        zones = pipeline.find_manual_clip_zones(300.0, 5)
         for z in zones:
             dur = z["end"] - z["start"]
             self.assertGreaterEqual(dur, pipeline.MIN_DURATION - 0.1)
             self.assertLessEqual(dur, pipeline.MAX_DURATION + 0.1)
 
     def test_no_overlap(self):
-        segs  = _segs(30, 300.0)
-        zones = pipeline.find_manual_clip_zones(segs, 5)
+        zones = pipeline.find_manual_clip_zones(300.0, 5)
         zones = sorted(zones, key=lambda z: z["start"])
         for i in range(len(zones) - 1):
             self.assertLessEqual(
@@ -86,17 +82,15 @@ class TestManualMode(unittest.TestCase):
                 f"Overlap between zone {i} and {i+1}",
             )
 
-    def test_empty_segments_returns_empty(self):
-        self.assertEqual(pipeline.find_manual_clip_zones([], 5), [])
-
     def test_zero_clips_returns_empty(self):
-        segs = _segs(10, 100.0)
-        self.assertEqual(pipeline.find_manual_clip_zones(segs, 0), [])
+        self.assertEqual(pipeline.find_manual_clip_zones(100.0, 0), [])
+
+    def test_zero_duration_returns_empty(self):
+        self.assertEqual(pipeline.find_manual_clip_zones(0.0, 5), [])
 
     def test_zones_within_video_bounds(self):
         span  = 180.0
-        segs  = _segs(20, span)
-        zones = pipeline.find_manual_clip_zones(segs, 4)
+        zones = pipeline.find_manual_clip_zones(span, 4)
         for z in zones:
             self.assertGreaterEqual(z["start"], 0.0)
             self.assertLessEqual(z["end"], span + 1.0)
@@ -134,36 +128,36 @@ class TestBurnVisuals(unittest.TestCase):
 
         mock_burn.assert_called_once()
 
-    def test_watermark_burned_without_captions_when_burn_visuals(self):
-        """No words + BURN_VISUALS=True → _burn_watermark_only is called."""
+    def test_captions_burned_when_no_words_fallback(self):
+        """No words → fallback word injected and _burn_captions_watermark still called."""
         pipeline.FAST_MODE    = True
         pipeline.BURN_VISUALS = True
         zone = self._zone()
 
-        with patch.object(pipeline, "_burn_captions_watermark") as mock_caps, \
-             patch.object(pipeline, "_burn_watermark_only", return_value=True) as mock_wm, \
+        with patch.object(pipeline, "_burn_captions_watermark", return_value=True) as mock_caps, \
+             patch.object(pipeline, "_burn_watermark_only") as mock_wm, \
              patch.object(pipeline, "generate_thumbnail", return_value=None), \
              patch.object(pipeline, "collect_words_for_zone", return_value=[]):
             pipeline._extract_one(1, zone, "in.mp4", "mp4", True, True, [MagicMock()])
 
-        mock_caps.assert_not_called()
-        mock_wm.assert_called_once()
+        mock_caps.assert_called_once()
+        mock_wm.assert_not_called()
 
-    def test_stream_copy_when_burn_visuals_false(self):
-        """No words + BURN_VISUALS=False → stream copy, no re-encode."""
+    def test_stream_copy_only_after_both_burns_fail(self):
+        """Stream copy is fallback only when both burn functions fail."""
         pipeline.FAST_MODE    = True
         pipeline.BURN_VISUALS = False
         zone = self._zone()
 
-        with patch.object(pipeline, "_burn_captions_watermark") as mock_caps, \
-             patch.object(pipeline, "_burn_watermark_only") as mock_wm, \
+        with patch.object(pipeline, "_burn_captions_watermark", return_value=False) as mock_caps, \
+             patch.object(pipeline, "_burn_watermark_only", return_value=False) as mock_wm, \
              patch.object(pipeline, "_stream_copy_clip", return_value=True) as mock_sc, \
              patch.object(pipeline, "generate_thumbnail", return_value=None), \
              patch.object(pipeline, "collect_words_for_zone", return_value=[]):
             pipeline._extract_one(1, zone, "in.mp4", "mp4", True, True, [MagicMock()])
 
-        mock_caps.assert_not_called()
-        mock_wm.assert_not_called()
+        mock_caps.assert_called_once()
+        mock_wm.assert_called_once()
         mock_sc.assert_called_once()
 
     def tearDown(self):
@@ -173,10 +167,10 @@ class TestBurnVisuals(unittest.TestCase):
 
 # ══════════════════════════════════════════════════════════════════════════════
 class TestAccurateSeek(unittest.TestCase):
-    """Caption burn uses accurate seek: -i input first, then -ss, then -t."""
+    """Caption burn uses two-pass seek: -ss pre -i input -ss fine -t dur."""
 
-    def test_single_ss_after_input(self):
-        """-i must appear before -ss (accurate seek, not fast seek)."""
+    def test_two_ss_flags(self):
+        """Must emit exactly two -ss flags (pre-seek + fine-seek)."""
         words = [{"word": "hi", "start": 0.0, "end": 0.5}]
         with patch.object(pipeline, "_run_ffmpeg", return_value=True) as mock_ffmpeg, \
              patch.object(pipeline, "_write_ass_subtitles"):
@@ -184,32 +178,33 @@ class TestAccurateSeek(unittest.TestCase):
 
         cmd = mock_ffmpeg.call_args[0][0]
         ss_indices = [i for i, x in enumerate(cmd) if x == "-ss"]
-        self.assertEqual(len(ss_indices), 1, "Expected exactly one -ss flag")
-        i_idx = cmd.index("-i")
-        self.assertGreater(ss_indices[0], i_idx, "-ss must appear after -i")
+        self.assertEqual(len(ss_indices), 2, "Expected two -ss flags (pre + fine)")
 
-    def test_ss_value_equals_start(self):
-        """-ss value must equal the clip start time exactly."""
+    def test_pre_seek_before_input(self):
+        """First -ss must appear before -i."""
         words = [{"word": "hi", "start": 0.0, "end": 0.5}]
-        for start in [0.0, 10.0, 30.5, 60.0]:
-            with patch.object(pipeline, "_run_ffmpeg", return_value=True) as mock_ffmpeg, \
-                 patch.object(pipeline, "_write_ass_subtitles"):
-                pipeline._burn_captions_watermark("in.mp4", start, 15.0, words, "out.mp4")
-            cmd = mock_ffmpeg.call_args[0][0]
-            ss_val = float(cmd[cmd.index("-ss") + 1])
-            self.assertAlmostEqual(ss_val, start, places=2,
-                                   msg=f"Expected -ss={start}, got {ss_val}")
-
-    def test_t_flag_after_ss(self):
-        """-t (duration) must appear after -ss."""
-        words = [{"word": "x", "start": 0.0, "end": 0.3}]
         with patch.object(pipeline, "_run_ffmpeg", return_value=True) as mock_ffmpeg, \
              patch.object(pipeline, "_write_ass_subtitles"):
-            pipeline._burn_captions_watermark("in.mp4", 30.0, 10.0, words, "out.mp4")
+            pipeline._burn_captions_watermark("in.mp4", 30.0, 15.0, words, "out.mp4")
+
         cmd = mock_ffmpeg.call_args[0][0]
-        ss_idx = cmd.index("-ss")
-        t_idx  = cmd.index("-t")
-        self.assertGreater(t_idx, ss_idx, "-t must appear after -ss")
+        first_ss = cmd.index("-ss")
+        i_idx    = cmd.index("-i")
+        self.assertLess(first_ss, i_idx, "First -ss should be before -i")
+
+    def test_pre_plus_fine_equals_start(self):
+        """pre_seek + fine_seek must equal the clip start exactly."""
+        words = [{"word": "x", "start": 0.0, "end": 0.3}]
+        for start in [30.0, 1.0, 0.5]:
+            with patch.object(pipeline, "_run_ffmpeg", return_value=True) as mock_ffmpeg, \
+                 patch.object(pipeline, "_write_ass_subtitles"):
+                pipeline._burn_captions_watermark("in.mp4", start, 10.0, words, "out.mp4")
+            cmd = mock_ffmpeg.call_args[0][0]
+            ss_idxs = [i for i, x in enumerate(cmd) if x == "-ss"]
+            pre  = float(cmd[ss_idxs[0] + 1])
+            fine = float(cmd[ss_idxs[1] + 1])
+            self.assertAlmostEqual(pre + fine, start, places=2,
+                                   msg=f"start={start}: pre+fine={pre+fine}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
