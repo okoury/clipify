@@ -808,6 +808,44 @@
   color: var(--accent-text);
   font-size: 11px;
   font-weight: 700;
+  padding: 2px 8px;
+  border-radius: 4px;
+  white-space: nowrap;
+}
+.badge-high   { background: rgba(255,80,0,0.18);  color: #ff7a40; }
+.badge-medium { background: rgba(255,200,0,0.15); color: #f0c040; }
+.badge-low    { background: rgba(255,255,255,0.07); color: var(--text-6); }
+
+.duration-estimate {
+  font-size: 12px;
+  color: var(--text-6);
+  text-align: center;
+  margin: -6px 0 4px;
+}
+
+.clip-reasons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-top: 6px;
+}
+.clip-reason-tag {
+  font-size: 10px;
+  background: rgba(255,255,255,0.06);
+  color: var(--text-6);
+  border-radius: 4px;
+  padding: 2px 7px;
+  border: 1px solid var(--border);
+}
+
+.clip-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+}
+.clip-download {
+  flex: 1;
+  font-weight: 700;
   padding: 3px 10px;
   border-radius: var(--r-full);
   border: 1px solid rgba(99,102,241,0.22);
@@ -853,7 +891,6 @@
 
 .clip-download {
   display: block;
-  width: 100%;
   background: rgba(255,255,255,0.04);
   border: 1px solid var(--border);
   padding: 10px;
@@ -864,11 +901,69 @@
   text-align: center;
   transition: all var(--t);
 }
-.clip-download:hover {
+.clip-download:hover, .share-btn:hover {
   background: rgba(255,255,255,0.08);
   color: var(--text-2);
   border-color: var(--border-strong);
 }
+
+.share-wrap { position: relative; }
+.share-btn {
+  display: block;
+  padding: 8px 14px;
+  background: rgba(255,255,255,0.04);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  color: var(--text-4);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all var(--t);
+}
+.share-dropdown {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  right: 0;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  overflow: hidden;
+  z-index: 50;
+  min-width: 180px;
+}
+.share-option {
+  display: block;
+  width: 100%;
+  padding: 10px 14px;
+  text-align: left;
+  font-size: 13px;
+  color: var(--text-3);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  transition: background var(--t);
+}
+.share-option:hover { background: rgba(255,255,255,0.06); }
+.share-option-soon { color: var(--text-6); cursor: default; }
+.soon-tag {
+  float: right;
+  font-size: 9px;
+  background: rgba(255,255,255,0.08);
+  border-radius: 3px;
+  padding: 1px 5px;
+  margin-top: 1px;
+}
+.share-result {
+  margin-top: 6px;
+  font-size: 11px;
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+.share-ok  { color: #4ade80; }
+.share-err { color: #f87171; }
+.share-ok a { color: #4ade80; text-decoration: underline; }
 
 
 /* ════════════════════════════════════════════════════════

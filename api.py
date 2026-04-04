@@ -66,6 +66,13 @@ class ChangePasswordBody(BaseModel):
     new_password: str
 
 
+class SocialUploadBody(BaseModel):
+    clip_url:    str
+    platform:    str
+    title:       str
+    description: str = ""
+
+
 class ForgotPasswordBody(BaseModel):
     email: str
 
@@ -185,6 +192,23 @@ def reset_password(body: ResetPasswordBody):
     db.consume_reset_token(body.token)
     db.update_user(row["user_id"], password_hash=auth.hash_password(body.new_password))
     return {"message": "Password updated successfully"}
+
+
+# ── Social upload endpoint ─────────────────────────────────────────────────────
+
+@app.post("/api/upload-social")
+def upload_social(body: SocialUploadBody,
+                  user_id: int = Depends(auth.get_current_user_id)):
+    from social_upload import upload_clip
+    # Resolve relative /clips/... URL to an absolute local path
+    rel = body.clip_url.lstrip("/")
+    file_path = os.path.join(HERE, rel)
+    if not os.path.exists(file_path):
+        raise HTTPException(404, "Clip file not found")
+    platform = body.platform.lower().strip()
+    if platform not in ("youtube", "tiktok", "instagram"):
+        raise HTTPException(400, f"Unsupported platform: {platform}")
+    return upload_clip(platform, file_path, body.title, body.description)
 
 
 # ── History endpoints ──────────────────────────────────────────────────────────

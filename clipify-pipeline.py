@@ -25,8 +25,10 @@ MAX_DURATION    = 90         # cap clips at this
 CLIP_PADDING    = 2.0        # seconds to extend before/after each clip zone
 MIN_ZONE_SCORE  = 5          # minimum cumulative score for a zone to qualify
 
-FAST_MODE         = True   # skip caption burn-in, use stream copy (much faster)
+FAST_MODE         = True   # use stream copy for clips without captions
+BURN_VISUALS      = True   # always burn watermark/header when visuals enabled
 MAX_SCAN_SEGMENTS = 5000   # hard cap on segments scanned to prevent O(n) blowup
+SCORE_FACTOR      = 2.5    # multiply raw score → normalized 0–100 for UI display
 
 # ── Clip-length presets ───────────────────────────────────────────────────────
 DURATION_PRESETS = {
@@ -569,6 +571,78 @@ def _generate_fallback_zones(video_duration: float, n: int) -> list:
     return zones
 
 
+# ── Manual mode: deterministic, guaranteed clip count ─────────────────────────
+def find_manual_clip_zones(segments, n: int) -> list:
+    """
+    Divide the timeline into n equal windows.  For each window pick the
+    highest-scoring segment as the clip centre, then hard-clamp to
+    [MIN_DURATION, MAX_DURATION].  Guarantees no overlap and deterministic output.
+    Does NOT depend on score floors or retry logic.
+    """
+    if not segments or n <= 0:
+        return []
+
+    video_duration = segments[-1].end
+    if video_duration < MIN_DURATION * n:
+        # Not enough video for n non-overlapping clips
+        n = max(1, int(video_duration // MIN_DURATION))
+
+    window   = video_duration / n
+    clip_dur = min(max(MIN_DURATION, TARGET_DURATION), MAX_DURATION)
+    zones    = []
+
+    for i in range(n):
+        win_start = i * window
+        win_end   = (i + 1) * window
+
+        # Pick the highest-scoring segment whose midpoint falls in this window
+        win_segs = [s for s in segments
+                    if (s.start + s.end) / 2 >= win_start
+                    and (s.start + s.end) / 2 < win_end]
+
+        if win_segs:
+            best = max(win_segs,
+                       key=lambda s: score_segment(clean(s.text), s.end - s.start)[0])
+            mid = (best.start + best.end) / 2
+        else:
+            mid = (win_start + win_end) / 2
+
+        start = max(0.0, round(mid - clip_dur / 2, 2))
+        end   = round(min(video_duration, start + clip_dur), 2)
+
+        # Push forward to avoid overlap with previous zone
+        if zones and start < zones[-1]["end"] + 0.5:
+            start = round(zones[-1]["end"] + 0.5, 2)
+            end   = round(min(video_duration, start + clip_dur), 2)
+
+        dur = end - start
+        if dur < MIN_DURATION:
+            continue
+        if dur > MAX_DURATION:
+            end = round(start + MAX_DURATION, 2)
+
+        # Gather text + score for this zone
+        zone_segs = [s for s in segments if s.start < end and s.end > start]
+        text      = censor(clean(" ".join(s.text for s in zone_segs)))
+        z_score   = 0.0
+        reasons   = []
+        for s in zone_segs:
+            sc, rs = score_segment(clean(s.text), s.end - s.start)
+            z_score += sc
+            reasons.extend(rs)
+        reasons = list(dict.fromkeys(reasons))[:5]
+
+        zones.append({
+            "start":   round(start, 2),
+            "end":     round(end, 2),
+            "score":   round(z_score, 1),
+            "text":    text,
+            "reasons": reasons,
+        })
+
+    return zones
+
+
 # ── Deduplication (remove overlapping zones, keep highest score) ──────────────
 def dedup_zones(zones):
     zones = sorted(zones, key=lambda x: x["score"], reverse=True)
@@ -866,9 +940,15 @@ def _burn_captions_watermark(input_file: str, start: float, duration: float,
                 f"enable='lt(t\\,{HEADER_DURATION})'"
             )
 
+        # Two-pass seek: fast keyframe seek to within 2s, then frame-accurate fine seek.
+        # Guarantees word timestamps (relative to zone start) stay in sync.
+        pre_seek  = max(0.0, start - 2.0)
+        fine_seek = round(start - pre_seek, 3)
         return _run_ffmpeg([
             "ffmpeg", "-y",
-            "-ss", str(start), "-i", input_file,
+            "-ss", str(pre_seek),
+            "-i", input_file,
+            "-ss", str(fine_seek),
             "-t", str(duration),
             "-vf", ",".join(vf_parts),
             "-c:v", "libx264", "-preset", "fast", "-crf", "23",
@@ -881,6 +961,34 @@ def _burn_captions_watermark(input_file: str, start: float, duration: float,
             os.unlink(ass_path)
         except OSError:
             pass
+
+
+def _burn_watermark_only(input_file: str, start: float, duration: float,
+                          out_path: str, header_title: str = "") -> bool:
+    """Re-encode clip with watermark (+ optional header) but no captions."""
+    vf_parts = [
+        "drawtext=text='Snipflow':fontcolor=white@0.22:fontsize=28:"
+        "x=w-tw-20:y=h-th-20:shadowcolor=black@0.15:shadowx=1:shadowy=1",
+    ]
+    if HEADER_ENABLED and header_title:
+        safe_hdr = header_title.replace("'", "\\'").replace(":", "\\:")
+        y_expr   = "80" if HEADER_POSITION == "top" else "(h-th)/2"
+        vf_parts.append(
+            f"drawtext=text='{safe_hdr}':fontcolor=white:fontsize=54:"
+            f"x=(w-tw)/2:y={y_expr}:"
+            f"shadowcolor=black@0.65:shadowx=3:shadowy=3:"
+            f"enable='lt(t\\,{HEADER_DURATION})'"
+        )
+    return _run_ffmpeg([
+        "ffmpeg", "-y",
+        "-ss", str(start), "-i", input_file,
+        "-t", str(duration),
+        "-vf", ",".join(vf_parts),
+        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+        "-c:a", "aac", "-b:a", "128k",
+        "-movflags", "+faststart",
+        out_path,
+    ], timeout=600)
 
 
 def _extract_one(i, zone, input_file, ext, video, annotate, segments, custom_hook=""):
@@ -898,13 +1006,23 @@ def _extract_one(i, zone, input_file, ext, video, annotate, segments, custom_hoo
         # Collect words first so we can attempt caption burn-in
         words = collect_words_for_zone(segments, start, end) if (annotate and segments) else []
 
-        if words and not FAST_MODE:
+        if words:
+            # Always burn captions when we have them — FAST_MODE does NOT disable this
             ok = _burn_captions_watermark(
                 input_file, start, duration, words, out_path,
                 header_title=_thumbnail_label(title, score=zone["score"]),
             )
             if not ok:
-                print(f"  clip_{i} caption burn failed, falling back to stream copy...", flush=True)
+                print(f"  clip_{i} caption burn failed, falling back...", flush=True)
+
+        if not ok and BURN_VISUALS:
+            # No captions but BURN_VISUALS: add watermark + optional header
+            ok = _burn_watermark_only(
+                input_file, start, duration, out_path,
+                header_title=_thumbnail_label(title, score=zone["score"]),
+            )
+            if not ok:
+                print(f"  clip_{i} watermark burn failed, falling back to stream copy...", flush=True)
 
         if not ok:
             ok = _stream_copy_clip(input_file, start, duration, out_path)
@@ -925,14 +1043,16 @@ def _extract_one(i, zone, input_file, ext, video, annotate, segments, custom_hoo
     print(f"  ✓ clip_{i} [{fmt_ts(start)}-{fmt_ts(end)}] {duration:.0f}s — {title}", flush=True)
 
     clip = {
-        "title":   title,
-        "summary": generate_clip_summary(zone["text"], score=zone["score"]),
-        "start":   start,
-        "end":     end,
-        "score":   zone["score"],
-        "url":     f"/clips/{filename}",
-        "text":    zone["text"],
-        "words":   words,
+        "title":            title,
+        "summary":          generate_clip_summary(zone["text"], score=zone["score"]),
+        "start":            start,
+        "end":              end,
+        "score":            zone["score"],
+        "normalized_score": min(100, int(zone["score"] * SCORE_FACTOR)),
+        "reasons":          zone.get("reasons", [])[:3],
+        "url":              f"/clips/{filename}",
+        "text":             zone["text"],
+        "words":            words,
     }
 
     if video:
@@ -1097,51 +1217,17 @@ if __name__ == "__main__":
                     print("WARNING: no speech detected in video", file=sys.stderr)
                     output = {"clips": []}
                 else:
-                    # audio_path (WAV) stays alive here so find_clip_zones can read energy
-                    zones = find_clip_zones(segments, audio_path=transcribe_path,
-                                            max_clips=max_clips)
-                    zones = dedup_zones(zones)
-
-                    # ── Clip count logic ──────────────────────────────────────
                     if max_clips > 0:
-                        if len(zones) < max_clips:
-                            # Pass 1 failed — retry with no score floor
-                            print(f"  ⚠ Only {len(zones)}/{max_clips} zones found; "
-                                  "retrying with min_zone_score=0...", flush=True)
-                            all_zones = find_clip_zones(
-                                segments, audio_path=transcribe_path,
-                                min_zone_score=0, max_clips=max_clips,
-                            )
-                            all_zones = dedup_zones(all_zones)
-                            zones = sorted(all_zones, key=lambda z: z["score"],
-                                           reverse=True)[:max_clips]
-                        else:
-                            zones = sorted(zones, key=lambda z: z["score"],
-                                           reverse=True)[:max_clips]
+                        # ── Manual mode: deterministic, guaranteed count ───────
+                        print(f"  📌 Manual mode: {max_clips} clip(s) requested", flush=True)
+                        zones = find_manual_clip_zones(segments, max_clips)
+                    else:
+                        # ── Auto mode: score-based ────────────────────────────
+                        zones = find_clip_zones(segments, audio_path=transcribe_path)
+                        zones = dedup_zones(zones)
 
-                        # Pass 2 still not enough → fill with evenly-spaced fallback clips
-                        if len(zones) < max_clips:
-                            video_dur = segments[-1].end
-                            needed    = max_clips - len(zones)
-                            fb_zones  = _generate_fallback_zones(video_dur, needed)
-                            # Exclude fallback zones that overlap existing scored zones
-                            existing_ends = {(z["start"], z["end"]) for z in zones}
-                            fb_zones = [
-                                fz for fz in fb_zones
-                                if not any(
-                                    max(fz["start"], z["start"]) < min(fz["end"], z["end"])
-                                    for z in zones
-                                )
-                            ]
-                            zones = sorted(zones + fb_zones[:needed],
-                                           key=lambda z: z["start"])
-                            print(f"  ℹ Added {len(fb_zones[:needed])} evenly-spaced "
-                                  "fallback clip(s)", flush=True)
-                        else:
-                            zones = sorted(zones, key=lambda z: z["start"])
-
-                    print(f"\n✅ {len(zones)}/{max_clips if max_clips else 'auto'} "
-                          f"clip(s) returned\n", flush=True)
+                    print(f"\n✅ {len(zones)} clip(s) "
+                          f"({'manual' if max_clips else 'auto'} mode)\n", flush=True)
                     for i, z in enumerate(zones, 1):
                         print(f"  {i}. [{fmt_ts(z['start'])}-{fmt_ts(z['end'])}] "
                               f"{z['end']-z['start']:.0f}s | score {z['score']}", flush=True)

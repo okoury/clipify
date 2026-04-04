@@ -72,6 +72,92 @@ const fmtDate     = (iso) => {
   return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
 }
 
+// ── Duration estimation ───────────────────────────────────────────────────────
+const getVideoDuration = (file) => new Promise((resolve) => {
+  const v = document.createElement('video')
+  v.preload = 'metadata'
+  v.onloadedmetadata = () => { URL.revokeObjectURL(v.src); resolve(v.duration) }
+  v.onerror = () => resolve(null)
+  v.src = URL.createObjectURL(file)
+})
+
+function estimateTime(sec) {
+  if (!sec) return null
+  const m = sec / 60
+  if (m < 10)  return '20–40 sec'
+  if (m < 60)  return '1–3 min'
+  if (m < 240) return '3–6 min'
+  return '5–10 min'
+}
+
+// ── Score label ───────────────────────────────────────────────────────────────
+function ScoreLabel({ score }) {
+  if (score == null) return null
+  const label = score > 80 ? '🔥 HIGH' : score > 50 ? '⚡ MEDIUM' : '· LOW'
+  const cls   = score > 80 ? 'badge-high' : score > 50 ? 'badge-medium' : 'badge-low'
+  return <span className={`badge ${cls}`}>{label}</span>
+}
+
+// ── Share button ──────────────────────────────────────────────────────────────
+const PLATFORMS = [
+  { id: 'youtube',   label: 'YouTube Shorts', available: true  },
+  { id: 'tiktok',    label: 'TikTok',         available: false },
+  { id: 'instagram', label: 'Instagram Reels',available: false },
+]
+
+function ShareButton({ clip, token }) {
+  const [open,    setOpen]    = useState(false)
+  const [loading, setLoading] = useState(false)
+  const [result,  setResult]  = useState(null)
+
+  const handleShare = async (platform) => {
+    setOpen(false); setLoading(true); setResult(null)
+    try {
+      const headers = { 'Content-Type': 'application/json' }
+      if (token) headers['Authorization'] = `Bearer ${token}`
+      const res = await fetch('/api/upload-social', {
+        method: 'POST', headers,
+        body: JSON.stringify({ clip_url: clip.url, platform,
+                               title: clip.title || 'Snipflow Clip',
+                               description: clip.summary || '' }),
+      })
+      const data = await res.json()
+      setResult(data)
+    } catch (e) {
+      setResult({ ok: false, error: e.message })
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  return (
+    <div className="share-wrap">
+      <button className="share-btn" onClick={() => setOpen(v => !v)} disabled={loading}>
+        {loading ? 'Sharing…' : '↑ Share'}
+      </button>
+      {open && (
+        <div className="share-dropdown">
+          {PLATFORMS.map(p => (
+            <button key={p.id}
+              className={`share-option${p.available ? '' : ' share-option-soon'}`}
+              onClick={() => p.available && handleShare(p.id)}
+              disabled={!p.available}>
+              {p.label}{!p.available && <span className="soon-tag">soon</span>}
+            </button>
+          ))}
+        </div>
+      )}
+      {result && (
+        <div className={`share-result ${result.ok ? 'share-ok' : 'share-err'}`}>
+          {result.ok
+            ? <><span>✓ Uploaded!</span>{result.url && <a href={result.url} target="_blank" rel="noreferrer">View →</a>}</>
+            : <span>✗ {result.error}</span>}
+        </div>
+      )}
+    </div>
+  )
+}
+
 // API helper
 const makeApi = (token) => async (path, opts = {}) => {
   const headers = { 'Content-Type': 'application/json', ...opts.headers }
@@ -895,6 +981,7 @@ export default function App() {
   const [emojis,          setEmojis]          = useState(false)
   const [punchyHeader,    setPunchyHeader]    = useState(true)
   const [customHook,      setCustomHook]      = useState('')
+  const [videoDuration,   setVideoDuration]   = useState(null)
   const [clips,     setClips]     = useState([])
   const [dragOver,  setDragOver]  = useState(false)
   const fileRef   = useRef(null)
@@ -915,7 +1002,12 @@ export default function App() {
     return () => { clearInterval(progRef.current); clearInterval(statRef.current) }
   }, [loading])
 
-  const handleFile     = (f) => { if (f && f.type.startsWith('video/')) setFile(f) }
+  const handleFile     = (f) => {
+    if (f && f.type.startsWith('video/')) {
+      setFile(f)
+      getVideoDuration(f).then(setVideoDuration)
+    }
+  }
   const handleDrop     = useCallback((e) => { e.preventDefault(); setDragOver(false); handleFile(e.dataTransfer.files[0]) }, [])
   const handleDragOver = useCallback((e) => { e.preventDefault(); setDragOver(true) }, [])
   const handleDragLeave= useCallback(() => setDragOver(false), [])
@@ -1092,8 +1184,15 @@ export default function App() {
                 </div>
               )}
 
+              {file && estimateTime(videoDuration) && (
+                <p className="duration-estimate">
+                  ⏱ Estimated processing time: ~{estimateTime(videoDuration)}
+                </p>
+              )}
               <button className="generate-btn" onClick={handleUpload} disabled={!file || loading}>
-                {loading ? 'Processing…' : mode==='annotate' ? 'Annotate Video' : 'Generate Clips'}
+                {loading
+                  ? `Processing… ${estimateTime(videoDuration) ? `(~${estimateTime(videoDuration)} expected)` : ''}`
+                  : mode==='annotate' ? 'Annotate Video' : 'Generate Clips'}
               </button>
 
               {!user && (
@@ -1126,7 +1225,10 @@ export default function App() {
                       {clip.url?.endsWith('.mp4')
                         ? clip.words?.length ? <CaptionedVideo src={clip} showEmojis={emojis} showHighlight={mode==='annotate'?true:highlight} highlightStyle={highlightStyle} captionFont={captionFont} /> : <video src={clip.url} poster={clip.thumbnail} controls />
                         : <audio src={clip.url} controls />}
-                      <div className="clip-header"><h3>{clip.title||`Clip ${idx+1}`}</h3>{clip.score!=null&&<span className="badge">⚡ {clip.score}</span>}</div>
+                      <div className="clip-header">
+                        <h3>{clip.title||`Clip ${idx+1}`}</h3>
+                        <ScoreLabel score={clip.normalized_score} />
+                      </div>
                       <div className="clip-timestamp">{fmt(clip.start)} &ndash; {fmt(clip.end)}</div>
                       {clip.summary && (
                         <div className="clip-summary-block">
@@ -1134,7 +1236,18 @@ export default function App() {
                           <p className="clip-summary">{censorText(clip.summary)}</p>
                         </div>
                       )}
-                      <a className="clip-download" href={clip.url} download>↓ Download Clip</a>
+                      {clip.reasons?.length > 0 && (
+                        <div className="clip-reasons">
+                          {clip.reasons.slice(0,3).map((r,j) => (
+                            <span key={j} className="clip-reason-tag">{r}</span>
+                          ))}
+                        </div>
+                      )}
+                      <div className="clip-actions">
+                        <a className="clip-download" href={clip.url} download>↓ Download</a>
+                        {clip.url?.endsWith('.mp4') && token &&
+                          <ShareButton clip={clip} token={token} />}
+                      </div>
                     </div>
                   ))}
                 </div>

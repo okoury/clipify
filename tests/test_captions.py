@@ -298,15 +298,19 @@ class TestBurnCaptionsWatermark(unittest.TestCase):
         self.assertFalse(result)
 
     def test_start_offset_passed_to_ffmpeg(self):
+        """Two-pass seek: pre_seek + fine_seek must sum to the original start."""
         words = [{"word": "hi", "start": 0.0, "end": 0.5}]
+        start = 30.5
         with patch.object(pipeline, "_run_ffmpeg", return_value=True) as mock_ffmpeg, \
              patch.object(pipeline, "_write_ass_subtitles"):
             pipeline._burn_captions_watermark(
-                "input.mp4", 30.5, 15.0, words, "output.mp4"
+                "input.mp4", start, 15.0, words, "output.mp4"
             )
-        cmd = mock_ffmpeg.call_args[0][0]
-        ss_idx = cmd.index("-ss")
-        self.assertEqual(cmd[ss_idx + 1], "30.5")
+        cmd      = mock_ffmpeg.call_args[0][0]
+        ss_idxs  = [i for i, x in enumerate(cmd) if x == "-ss"]
+        pre_seek  = float(cmd[ss_idxs[0] + 1])
+        fine_seek = float(cmd[ss_idxs[1] + 1])
+        self.assertAlmostEqual(pre_seek + fine_seek, start, places=2)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
