@@ -574,17 +574,16 @@ def _generate_fallback_zones(video_duration: float, n: int) -> list:
 # ── Manual mode: deterministic, guaranteed clip count ─────────────────────────
 def find_manual_clip_zones(segments, n: int) -> list:
     """
-    Divide the timeline into n equal windows.  For each window pick the
-    highest-scoring segment as the clip centre, then hard-clamp to
-    [MIN_DURATION, MAX_DURATION].  Guarantees no overlap and deterministic output.
-    Does NOT depend on score floors or retry logic.
+    Divide the timeline into n equal windows; use the window midpoint as the
+    clip centre (no scoring used for placement — fully deterministic).
+    Hard-clamps to [MIN_DURATION, MAX_DURATION], never skips a window.
     """
     if not segments or n <= 0:
         return []
 
     video_duration = segments[-1].end
+    # Reduce n only if there is literally not enough video for n clips
     if video_duration < MIN_DURATION * n:
-        # Not enough video for n non-overlapping clips
         n = max(1, int(video_duration // MIN_DURATION))
 
     window   = video_duration / n
@@ -594,50 +593,31 @@ def find_manual_clip_zones(segments, n: int) -> list:
     for i in range(n):
         win_start = i * window
         win_end   = (i + 1) * window
-
-        # Pick the highest-scoring segment whose midpoint falls in this window
-        win_segs = [s for s in segments
-                    if (s.start + s.end) / 2 >= win_start
-                    and (s.start + s.end) / 2 < win_end]
-
-        if win_segs:
-            best = max(win_segs,
-                       key=lambda s: score_segment(clean(s.text), s.end - s.start)[0])
-            mid = (best.start + best.end) / 2
-        else:
-            mid = (win_start + win_end) / 2
+        mid       = (win_start + win_end) / 2   # purely positional — no scoring
 
         start = max(0.0, round(mid - clip_dur / 2, 2))
         end   = round(min(video_duration, start + clip_dur), 2)
 
-        # Push forward to avoid overlap with previous zone
+        # Push forward to avoid overlap with the previous zone
         if zones and start < zones[-1]["end"] + 0.5:
             start = round(zones[-1]["end"] + 0.5, 2)
             end   = round(min(video_duration, start + clip_dur), 2)
 
-        dur = end - start
-        if dur < MIN_DURATION:
-            continue
-        if dur > MAX_DURATION:
+        # Hard clamp — never skip (guarantees count)
+        if end - start > MAX_DURATION:
             end = round(start + MAX_DURATION, 2)
+        # Accept whatever remains (even if slightly < MIN_DURATION near end of file)
 
-        # Gather text + score for this zone
+        # Gather text for this zone (display only — not used for placement)
         zone_segs = [s for s in segments if s.start < end and s.end > start]
         text      = censor(clean(" ".join(s.text for s in zone_segs)))
-        z_score   = 0.0
-        reasons   = []
-        for s in zone_segs:
-            sc, rs = score_segment(clean(s.text), s.end - s.start)
-            z_score += sc
-            reasons.extend(rs)
-        reasons = list(dict.fromkeys(reasons))[:5]
 
         zones.append({
             "start":   round(start, 2),
             "end":     round(end, 2),
-            "score":   round(z_score, 1),
+            "score":   0.0,       # manual zones have no scoring
             "text":    text,
-            "reasons": reasons,
+            "reasons": [],
         })
 
     return zones
@@ -940,15 +920,10 @@ def _burn_captions_watermark(input_file: str, start: float, duration: float,
                 f"enable='lt(t\\,{HEADER_DURATION})'"
             )
 
-        # Two-pass seek: fast keyframe seek to within 2s, then frame-accurate fine seek.
-        # Guarantees word timestamps (relative to zone start) stay in sync.
-        pre_seek  = max(0.0, start - 2.0)
-        fine_seek = round(start - pre_seek, 3)
         return _run_ffmpeg([
             "ffmpeg", "-y",
-            "-ss", str(pre_seek),
             "-i", input_file,
-            "-ss", str(fine_seek),
+            "-ss", str(start),
             "-t", str(duration),
             "-vf", ",".join(vf_parts),
             "-c:v", "libx264", "-preset", "fast", "-crf", "23",
@@ -981,7 +956,8 @@ def _burn_watermark_only(input_file: str, start: float, duration: float,
         )
     return _run_ffmpeg([
         "ffmpeg", "-y",
-        "-ss", str(start), "-i", input_file,
+        "-i", input_file,
+        "-ss", str(start),
         "-t", str(duration),
         "-vf", ",".join(vf_parts),
         "-c:v", "libx264", "-preset", "fast", "-crf", "23",
