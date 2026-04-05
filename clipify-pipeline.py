@@ -574,32 +574,43 @@ def _generate_fallback_zones(video_duration: float, n: int) -> list:
 # ── Manual mode: deterministic, guaranteed clip count ─────────────────────────
 def find_manual_clip_zones(video_duration: float, n: int) -> list:
     """
-    Purely deterministic: divide timeline into n equal windows, take clip_dur
-    centred in each window. NO scoring, NO transcript dependency.
-    Always returns exactly n zones.
+    Purely deterministic: divide timeline into n equal windows, place a clip of
+    clip_dur centred in each window.  NO scoring, NO transcript dependency.
+    Always returns exactly n zones with durations in [MIN_DURATION, MAX_DURATION].
     """
     if n <= 0 or video_duration <= 0:
         return []
 
     clip_dur = min(max(MIN_DURATION, TARGET_DURATION), MAX_DURATION)
     window   = video_duration / n
-    zones    = []
 
+    # If n clips at target duration overflow the video, shrink to fit —
+    # but never below MIN_DURATION.  If even MIN_DURATION doesn't fit, use
+    # whatever we can (n * MIN_DURATION > video_duration edge-case).
+    if clip_dur * n > video_duration:
+        clip_dur = max(MIN_DURATION, round(video_duration / n, 2))
+
+    # When clips nearly fill each window, centring causes cascading 0.5s pushes
+    # that overflow the video.  Use sequential packing instead.
+    packed = clip_dur >= window - 0.5
+
+    zones = []
     for i in range(n):
-        mid   = (i + 0.5) * window          # centre of window — purely positional
-        start = max(0.0, round(mid - clip_dur / 2, 2))
-        end   = round(min(video_duration, start + clip_dur), 2)
+        if packed:
+            start = round(i * (video_duration / n), 2)
+        else:
+            mid   = (i + 0.5) * window
+            start = max(0.0, round(mid - clip_dur / 2, 2))
+            # Push forward to clear previous zone (never skip)
+            if zones and start < zones[-1]["end"] + 0.5:
+                start = round(zones[-1]["end"] + 0.5, 2)
 
-        # Push forward to clear previous zone (never skip)
-        if zones and start < zones[-1]["end"] + 0.5:
-            start = round(zones[-1]["end"] + 0.5, 2)
-            end   = round(min(video_duration, start + clip_dur), 2)
-
+        end = round(min(video_duration, start + clip_dur), 2)
         zones.append({
             "start":   start,
             "end":     end,
             "score":   0.0,
-            "text":    "",        # filled after transcription
+            "text":    "",    # filled after transcription
             "reasons": [],
         })
 
@@ -801,13 +812,18 @@ def _run_ffmpeg(cmd, timeout=300):
 
 
 def get_video_duration(video_path: str) -> float:
-    """Use ffprobe to return video duration in seconds (no transcription needed)."""
+    """Return video duration in seconds using ffmpeg (ffprobe not required)."""
     r = subprocess.run(
-        ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", video_path],
+        ["ffmpeg", "-i", video_path],
         capture_output=True, text=True,
     )
-    data = json.loads(r.stdout)
-    return float(data["format"]["duration"])
+    # ffmpeg writes container info to stderr regardless of exit code
+    for line in r.stderr.splitlines():
+        m = re.search(r'Duration:\s*(\d+):(\d+):([\d.]+)', line)
+        if m:
+            h, mins, secs = int(m.group(1)), int(m.group(2)), float(m.group(3))
+            return h * 3600 + mins * 60 + secs
+    raise RuntimeError(f"Could not determine duration of {video_path}")
 
 
 def _ts_ass(seconds: float) -> str:
