@@ -167,10 +167,10 @@ class TestBurnVisuals(unittest.TestCase):
 
 # ══════════════════════════════════════════════════════════════════════════════
 class TestAccurateSeek(unittest.TestCase):
-    """Caption burn uses two-pass seek: -ss pre -i input -ss fine -t dur."""
+    """Caption burn: accurate seek (-i first, -ss after) + setpts=PTS-STARTPTS."""
 
-    def test_two_ss_flags(self):
-        """Must emit exactly two -ss flags (pre-seek + fine-seek)."""
+    def test_single_ss_after_input(self):
+        """Exactly one -ss, and it appears after -i."""
         words = [{"word": "hi", "start": 0.0, "end": 0.5}]
         with patch.object(pipeline, "_run_ffmpeg", return_value=True) as mock_ffmpeg, \
              patch.object(pipeline, "_write_ass_subtitles"):
@@ -178,33 +178,31 @@ class TestAccurateSeek(unittest.TestCase):
 
         cmd = mock_ffmpeg.call_args[0][0]
         ss_indices = [i for i, x in enumerate(cmd) if x == "-ss"]
-        self.assertEqual(len(ss_indices), 2, "Expected two -ss flags (pre + fine)")
+        self.assertEqual(len(ss_indices), 1)
+        self.assertGreater(ss_indices[0], cmd.index("-i"))
 
-    def test_pre_seek_before_input(self):
-        """First -ss must appear before -i."""
-        words = [{"word": "hi", "start": 0.0, "end": 0.5}]
-        with patch.object(pipeline, "_run_ffmpeg", return_value=True) as mock_ffmpeg, \
-             patch.object(pipeline, "_write_ass_subtitles"):
-            pipeline._burn_captions_watermark("in.mp4", 30.0, 15.0, words, "out.mp4")
-
-        cmd = mock_ffmpeg.call_args[0][0]
-        first_ss = cmd.index("-ss")
-        i_idx    = cmd.index("-i")
-        self.assertLess(first_ss, i_idx, "First -ss should be before -i")
-
-    def test_pre_plus_fine_equals_start(self):
-        """pre_seek + fine_seek must equal the clip start exactly."""
+    def test_ss_equals_start(self):
+        """-ss value equals the clip start time."""
         words = [{"word": "x", "start": 0.0, "end": 0.3}]
-        for start in [30.0, 1.0, 0.5]:
+        for start in [0.0, 30.0, 30.5]:
             with patch.object(pipeline, "_run_ffmpeg", return_value=True) as mock_ffmpeg, \
                  patch.object(pipeline, "_write_ass_subtitles"):
                 pipeline._burn_captions_watermark("in.mp4", start, 10.0, words, "out.mp4")
             cmd = mock_ffmpeg.call_args[0][0]
-            ss_idxs = [i for i, x in enumerate(cmd) if x == "-ss"]
-            pre  = float(cmd[ss_idxs[0] + 1])
-            fine = float(cmd[ss_idxs[1] + 1])
-            self.assertAlmostEqual(pre + fine, start, places=2,
-                                   msg=f"start={start}: pre+fine={pre+fine}")
+            ss_val = float(cmd[cmd.index("-ss") + 1])
+            self.assertAlmostEqual(ss_val, start, places=2)
+
+    def test_setpts_in_vf(self):
+        """setpts=PTS-STARTPTS must appear in the -vf string before ass=."""
+        words = [{"word": "x", "start": 0.0, "end": 0.3}]
+        with patch.object(pipeline, "_run_ffmpeg", return_value=True) as mock_ffmpeg, \
+             patch.object(pipeline, "_write_ass_subtitles"):
+            pipeline._burn_captions_watermark("in.mp4", 30.0, 10.0, words, "out.mp4")
+        cmd = mock_ffmpeg.call_args[0][0]
+        vf = cmd[cmd.index("-vf") + 1]
+        self.assertIn("setpts=PTS-STARTPTS", vf)
+        self.assertIn("ass=", vf)
+        self.assertLess(vf.index("setpts"), vf.index("ass="))
 
 
 # ══════════════════════════════════════════════════════════════════════════════

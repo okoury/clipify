@@ -909,8 +909,12 @@ def _burn_captions_watermark(input_file: str, start: float, duration: float,
         _write_ass_subtitles(words, ass_path)
         safe_ass = ass_path.replace("\\", "\\\\").replace(":", "\\:")
 
+        # setpts=PTS-STARTPTS MUST be first: it resets frame PTS to 0 so the
+        # ass= subtitle filter (which matches against PTS) sees 0-based times
+        # that align with the 0-based word timestamps in the ASS file.
         vf_parts = [
-            f"subtitles='{safe_ass}'",
+            "setpts=PTS-STARTPTS",
+            f"ass='{safe_ass}'",
             # Faint watermark — bottom-right corner
             "drawtext=text='Snipflow':fontcolor=white@0.22:fontsize=28:"
             "x=w-tw-20:y=h-th-20:shadowcolor=black@0.15:shadowx=1:shadowy=1",
@@ -927,15 +931,12 @@ def _burn_captions_watermark(input_file: str, start: float, duration: float,
                 f"enable='lt(t\\,{HEADER_DURATION})'"
             )
 
-        # Two-pass seek: fast keyframe seek then 2s accurate fine-seek.
-        # Avoids decoding entire video from start — critical for performance.
-        pre_seek  = max(0.0, start - 2.0)
-        fine_seek = round(start - pre_seek, 3)
+        # Single accurate seek: -i first so FFmpeg decodes to the exact frame.
+        # setpts=PTS-STARTPTS above then normalises PTS → 0 for the subtitle filter.
         return _run_ffmpeg([
             "ffmpeg", "-y",
-            "-ss", str(pre_seek),
             "-i", input_file,
-            "-ss", str(fine_seek),
+            "-ss", str(start),
             "-t", str(duration),
             "-vf", ",".join(vf_parts),
             "-c:v", "libx264", "-preset", "fast", "-crf", "23",
@@ -954,6 +955,7 @@ def _burn_watermark_only(input_file: str, start: float, duration: float,
                           out_path: str, header_title: str = "") -> bool:
     """Re-encode clip with watermark (+ optional header) but no captions."""
     vf_parts = [
+        "setpts=PTS-STARTPTS",   # normalize PTS → 0 so enable='lt(t,N)' works correctly
         "drawtext=text='Snipflow':fontcolor=white@0.22:fontsize=28:"
         "x=w-tw-20:y=h-th-20:shadowcolor=black@0.15:shadowx=1:shadowy=1",
     ]
@@ -966,13 +968,10 @@ def _burn_watermark_only(input_file: str, start: float, duration: float,
             f"shadowcolor=black@0.65:shadowx=3:shadowy=3:"
             f"enable='lt(t\\,{HEADER_DURATION})'"
         )
-    pre_seek  = max(0.0, start - 2.0)
-    fine_seek = round(start - pre_seek, 3)
     return _run_ffmpeg([
         "ffmpeg", "-y",
-        "-ss", str(pre_seek),
         "-i", input_file,
-        "-ss", str(fine_seek),
+        "-ss", str(start),
         "-t", str(duration),
         "-vf", ",".join(vf_parts),
         "-c:v", "libx264", "-preset", "fast", "-crf", "23",
@@ -1074,9 +1073,10 @@ def extract_clips(input_file: str, zones, annotate: bool = False, segments=None,
         }
         for fut in as_completed(futs):
             clip = fut.result()
-            if not clip:
-                raise RuntimeError(f"Clip {futs[fut]} failed to export — check FFmpeg output above")
-            results.append(clip)
+            if clip:
+                results.append(clip)
+            else:
+                print(f"  ⚠ clip {futs[fut]} failed — skipping", flush=True)
 
     # Restore chronological order (futures complete in arbitrary order)
     return sorted(results, key=lambda c: c["start"])

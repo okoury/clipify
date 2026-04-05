@@ -258,7 +258,8 @@ async def process_video(
         clip_length  = clip_length if clip_length in ("short", "medium", "long") else "medium"
         max_clips    = max(0, min(int(max_clips), 20))
         custom_hook  = (custom_hook or "").strip()[:120]   # cap length, strip whitespace
-        cache_mode   = "annotate_only" if annotate_only else ("annotate" if annotate else "clips")
+        # v4: busts all caches from prior pipeline versions
+        cache_mode   = "v4_" + ("annotate_only" if annotate_only else ("annotate" if annotate else "clips"))
 
         # ── Cache lookup ──────────────────────────────────────────────────────
         hasher = hashlib.sha256()
